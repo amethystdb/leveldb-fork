@@ -8,6 +8,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include <atomic>
 
 #include "db/dbformat.h"
 
@@ -15,8 +16,42 @@ namespace leveldb {
 
 class VersionSet;
 
+enum Strategy { kLeveled = 0, kTiered = 1 };
+
 struct FileMetaData {
-  FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
+  FileMetaData()
+      : refs(0),
+        allowed_seeks(1 << 30),
+        file_size(0),
+        strategy(kTiered),
+        readCount(0),
+        writeCount(0) {}
+
+  FileMetaData(const FileMetaData& other)
+      : refs(other.refs),
+        allowed_seeks(other.allowed_seeks),
+        number(other.number),
+        file_size(other.file_size),
+        smallest(other.smallest),
+        largest(other.largest),
+        strategy(other.strategy),
+        readCount(other.readCount.load(std::memory_order_relaxed)),
+        writeCount(other.writeCount.load(std::memory_order_relaxed)) {}
+
+  FileMetaData& operator=(const FileMetaData& other) {
+    if (this != &other) {
+      refs = other.refs;
+      allowed_seeks = other.allowed_seeks;
+      number = other.number;
+      file_size = other.file_size;
+      smallest = other.smallest;
+      largest = other.largest;
+      strategy = other.strategy;
+      readCount.store(other.readCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      writeCount.store(other.writeCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
+  }
 
   int refs;
   int allowed_seeks;  // Seeks allowed until compaction
@@ -24,6 +59,10 @@ struct FileMetaData {
   uint64_t file_size;    // File size in bytes
   InternalKey smallest;  // Smallest internal key served by table
   InternalKey largest;   // Largest internal key served by table
+
+  Strategy strategy;
+  std::atomic<int64_t> readCount;
+  std::atomic<int64_t> writeCount;
 };
 
 class VersionEdit {
@@ -61,12 +100,14 @@ class VersionEdit {
   // REQUIRES: This version has not been saved (see VersionSet::SaveTo)
   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
   void AddFile(int level, uint64_t file, uint64_t file_size,
-               const InternalKey& smallest, const InternalKey& largest) {
+               const InternalKey& smallest, const InternalKey& largest,
+               Strategy strategy = kTiered) {
     FileMetaData f;
     f.number = file;
     f.file_size = file_size;
     f.smallest = smallest;
     f.largest = largest;
+    f.strategy = strategy;
     new_files_.push_back(std::make_pair(level, f));
   }
 

@@ -306,15 +306,45 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
     size_t num_files = files_[level].size();
     if (num_files == 0) continue;
 
-    // Binary search to find earliest index whose largest key >= internal_key.
-    uint32_t index = FindFile(vset_->icmp_, files_[level], internal_key);
-    if (index < num_files) {
-      FileMetaData* f = files_[level][index];
-      if (ucmp->Compare(user_key, f->smallest.user_key()) < 0) {
-        // All of "f" is past any data for user_key
-      } else {
-        if (!(*func)(arg, level, f)) {
-          return;
+    // Check if the level contains any files tagged kTiered
+    bool level_contains_tiered = false;
+    for (size_t i = 0; i < num_files; i++) {
+      if (files_[level][i]->strategy == kTiered) {
+        level_contains_tiered = true;
+        break;
+      }
+    }
+
+    if (level_contains_tiered) {
+      // Fall back to a linear search (newest to oldest), treating them identically to Level 0 overlapping files.
+      std::vector<FileMetaData*> tmp;
+      tmp.reserve(num_files);
+      for (uint32_t i = 0; i < num_files; i++) {
+        FileMetaData* f = files_[level][i];
+        if (ucmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
+            ucmp->Compare(user_key, f->largest.user_key()) <= 0) {
+          tmp.push_back(f);
+        }
+      }
+      if (!tmp.empty()) {
+        std::sort(tmp.begin(), tmp.end(), NewestFirst);
+        for (uint32_t i = 0; i < tmp.size(); i++) {
+          if (!(*func)(arg, level, tmp[i])) {
+            return;
+          }
+        }
+      }
+    } else {
+      // Binary search to find earliest index whose largest key >= internal_key.
+      uint32_t index = FindFile(vset_->icmp_, files_[level], internal_key);
+      if (index < num_files) {
+        FileMetaData* f = files_[level][index];
+        if (ucmp->Compare(user_key, f->smallest.user_key()) < 0) {
+          // All of "f" is past any data for user_key
+        } else {
+          if (!(*func)(arg, level, f)) {
+            return;
+          }
         }
       }
     }
@@ -363,6 +393,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
           return true;  // Keep searching in other files
         case kFound:
           state->found = true;
+          f->readCount.fetch_add(1, std::memory_order_relaxed);
           return false;
         case kDeleted:
           return false;
@@ -1253,6 +1284,41 @@ Compaction* VersionSet::PickCompaction() {
   Compaction* c;
   int level;
 
+  // Cleanup history map in adaptive controller to prevent memory growth
+  {
+    std::set<uint64_t> active_files;
+    for (int l = 0; l < config::kNumLevels; l++) {
+      for (FileMetaData* file : current_->files_[l]) {
+        active_files.insert(file->number);
+      }
+    }
+    adaptive_controller_.Cleanup(active_files);
+  }
+
+  // Iterate over current files and check if any should switch strategy
+  for (int lvl = 0; lvl < config::kNumLevels - 1; lvl++) {
+    for (size_t i = 0; i < current_->files_[lvl].size(); i++) {
+      FileMetaData* f = current_->files_[lvl][i];
+      Strategy target_strategy = f->strategy;
+      if (adaptive_controller_.ShouldRewrite(f, &target_strategy)) {
+        level = lvl;
+        c = new Compaction(options_, level);
+        c->inputs_[0].push_back(f);
+        c->target_strategy_ = target_strategy;
+        c->input_version_ = current_;
+        c->input_version_->Ref();
+
+        if (level == 0) {
+          InternalKey smallest, largest;
+          GetRange(c->inputs_[0], &smallest, &largest);
+          current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
+        }
+        SetupOtherInputs(c);
+        return c;
+      }
+    }
+  }
+
   // We prefer compactions triggered by too much data in a level over
   // the compactions triggered by seeks.
   const bool size_compaction = (current_->compaction_score_ >= 1);
@@ -1484,7 +1550,8 @@ Compaction::Compaction(const Options* options, int level)
       input_version_(nullptr),
       grandparent_index_(0),
       seen_key_(false),
-      overlapped_bytes_(0) {
+      overlapped_bytes_(0),
+      target_strategy_(kTiered) {
   for (int i = 0; i < config::kNumLevels; i++) {
     level_ptrs_[i] = 0;
   }

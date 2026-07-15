@@ -21,6 +21,7 @@
 
 #include "db/dbformat.h"
 #include "db/version_edit.h"
+#include "db/adaptive_controller.h"
 #include "port/port.h"
 #include "port/thread_annotations.h"
 
@@ -313,6 +314,8 @@ class VersionSet {
   // Per-level key at which the next compaction at that level should start.
   // Either an empty string, or a valid InternalKey.
   std::string compact_pointer_[config::kNumLevels];
+
+  AdaptiveController adaptive_controller_;
 };
 
 // A Compaction encapsulates information about a compaction.
@@ -356,6 +359,9 @@ class Compaction {
   // Release the input version for the compaction, once the compaction
   // is successful.
   void ReleaseInputs();
+
+  Strategy target_strategy() const { return target_strategy_; }
+  Strategy target_strategy_;
 
  private:
   friend class Version;

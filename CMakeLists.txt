@@ -147,6 +147,8 @@ target_sources(leveldb
     "db/table_cache.h"
     "db/version_edit.cc"
     "db/version_edit.h"
+    "db/adaptive_controller.cc"
+    "db/adaptive_controller.h"
     "db/version_set.cc"
     "db/version_set.h"
     "db/write_batch_internal.h"
