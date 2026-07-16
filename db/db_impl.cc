@@ -150,9 +150,21 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
                                &internal_comparator_)) {}
 
 DBImpl::~DBImpl() {
+  // Signal shutdown and join the periodic adaptive-check thread BEFORE
+  // taking mutex_ below: if it were joined while mutex_ is held, a poll
+  // that's blocked acquiring that same mutex inside
+  // MaybeScheduleAdaptiveCheck would deadlock against this join. Setting
+  // the flag first lets it notice shutting_down_ (either before locking,
+  // or under the lock via its own re-check) and exit on its own; only
+  // once it has fully exited do we know it can't schedule new work
+  // during the drain-wait below.
+  shutting_down_.store(true, std::memory_order_release);
+  if (periodic_poll_thread_.joinable()) {
+    periodic_poll_thread_.join();
+  }
+
   // Wait for background work to finish.
   mutex_.Lock();
-  shutting_down_.store(true, std::memory_order_release);
   while (background_compaction_scheduled_) {
     background_work_finished_signal_.Wait();
   }
@@ -679,6 +691,55 @@ void DBImpl::MaybeScheduleCompaction() {
   } else {
     background_compaction_scheduled_ = true;
     env_->Schedule(&DBImpl::BGWork, this);
+  }
+}
+
+void DBImpl::MaybeScheduleAdaptiveCheck() {
+  mutex_.AssertHeld();
+  if (background_compaction_scheduled_) {
+    // Already scheduled
+  } else if (shutting_down_.load(std::memory_order_acquire)) {
+    // DB is being deleted; no more background work. Re-checked here
+    // under mutex_ (in addition to the poll thread's own pre-lock
+    // check) so a poll that was already mid-call when shutdown began
+    // cannot schedule new work during teardown.
+  } else if (!bg_error_.ok()) {
+    // Already got an error; no more changes
+  } else {
+    // Deliberately no NeedsCompaction() gate here -- see the comment on
+    // the declaration in db_impl.h.
+    background_compaction_scheduled_ = true;
+    env_->Schedule(&DBImpl::BGWork, this);
+  }
+}
+
+void DBImpl::PeriodicAdaptiveCheckLoop() {
+  const int kShutdownCheckSliceMicros = 250 * 1000;  // Hardcoded; see below.
+  const int poll_interval_micros = options_.adaptive_poll_interval_ms * 1000;
+
+  while (true) {
+    // Sleep in short, fixed slices (rather than one long sleep for
+    // options_.adaptive_poll_interval_ms) so shutdown latency stays
+    // bounded to this slice instead of the full research-tunable
+    // cadence above.
+    for (int waited = 0; waited < poll_interval_micros;
+         waited += kShutdownCheckSliceMicros) {
+      if (shutting_down_.load(std::memory_order_acquire)) {
+        return;
+      }
+      env_->SleepForMicroseconds(kShutdownCheckSliceMicros);
+    }
+    if (shutting_down_.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    // NOTE: fixes controller *scheduling* in read-heavy phases (a
+    // background pass now happens on a timer, not only as a side effect
+    // of write pressure) but not the per-file readCount reset on every
+    // compaction, so weak/slow kLeveled promotion may still occur until
+    // region-keyed counters (Phase 4) land.
+    MutexLock l(&mutex_);
+    MaybeScheduleAdaptiveCheck();
   }
 }
 
@@ -1602,6 +1663,12 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   impl->mutex_.Unlock();
   if (s.ok()) {
     assert(impl->mem_ != nullptr);
+    // AMETHYST: started only on the success path, so a failed Open (which
+    // falls through to `delete impl` below without ever reaching this
+    // line) leaves periodic_poll_thread_ in its default not-a-thread
+    // state, making ~DBImpl's joinable() guard a safe no-op.
+    impl->periodic_poll_thread_ =
+        std::thread(&DBImpl::PeriodicAdaptiveCheckLoop, impl);
     *dbptr = impl;
   } else {
     delete impl;

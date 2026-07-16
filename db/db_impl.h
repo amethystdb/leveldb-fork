@@ -9,6 +9,7 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -167,6 +168,20 @@ class DBImpl : public DB {
   void RecordBackgroundError(const Status& s);
 
   void MaybeScheduleCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // AMETHYST: unlike MaybeScheduleCompaction, deliberately has no
+  // NeedsCompaction() gate -- this is what lets PickCompaction's
+  // adaptive-rewrite check (which runs before the normal size/seek
+  // logic) get evaluated on a timer instead of only as a side effect of
+  // write pressure. Otherwise identical guard order/semantics, so it
+  // shares the same single-flight background_compaction_scheduled_ slot
+  // and can never race a real compaction.
+  void MaybeScheduleAdaptiveCheck() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  // AMETHYST: body of periodic_poll_thread_; sleeps in short slices so
+  // shutdown latency is bounded, then calls MaybeScheduleAdaptiveCheck.
+  void PeriodicAdaptiveCheckLoop();
+
   static void BGWork(void* db);
   void BackgroundCall();
   void BackgroundCompaction() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
@@ -223,6 +238,12 @@ class DBImpl : public DB {
 
   // Has a background compaction been scheduled or is running?
   bool background_compaction_scheduled_ GUARDED_BY(mutex_);
+
+  // AMETHYST: dedicated thread driving MaybeScheduleAdaptiveCheck on a
+  // timer (see PeriodicAdaptiveCheckLoop). Started at the end of a
+  // successful DB::Open, joined in ~DBImpl before mutex_ is taken for
+  // the pre-existing compaction-drain wait.
+  std::thread periodic_poll_thread_;
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
 

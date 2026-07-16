@@ -145,6 +145,14 @@ struct LEVELDB_EXPORT Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  // AMETHYST: interval, in milliseconds, at which a dedicated background
+  // thread periodically checks whether any file's tiered/leveled
+  // strategy should switch (AdaptiveController::ShouldRewrite), so that
+  // read-heavy phases with no write pressure can still trigger a
+  // promotion. This is a research/adaptation-cadence knob, not a stock
+  // LevelDB option.
+  int adaptive_poll_interval_ms = 2500;
 };
 
 // Options that control read operations
