@@ -20,7 +20,12 @@ enum Tag {
   kDeletedFile = 6,
   kNewFile = 7,
   // 8 was used for large value refs
-  kPrevLogNumber = 9
+  kPrevLogNumber = 9,
+  // Strategy (tiered/leveled) for the file whose number is given, emitted
+  // immediately after that file's kNewFile record. A MANIFEST written
+  // before this tag existed will simply have no kFileStrategy records;
+  // DecodeFrom defaults such files to kLeveled (see kNewFile handling).
+  kFileStrategy = 10
 };
 
 void VersionEdit::Clear() {
@@ -81,6 +86,10 @@ void VersionEdit::EncodeTo(std::string* dst) const {
     PutVarint64(dst, f.file_size);
     PutLengthPrefixedSlice(dst, f.smallest.Encode());
     PutLengthPrefixedSlice(dst, f.largest.Encode());
+
+    PutVarint32(dst, kFileStrategy);
+    PutVarint64(dst, f.number);
+    PutVarint32(dst, static_cast<uint32_t>(f.strategy));
   }
 }
 
@@ -180,11 +189,32 @@ Status VersionEdit::DecodeFrom(const Slice& src) {
             GetVarint64(&input, &f.file_size) &&
             GetInternalKey(&input, &f.smallest) &&
             GetInternalKey(&input, &f.largest)) {
+          // Safe default for MANIFESTs written before kFileStrategy existed:
+          // no accompanying strategy record will follow, so this stands.
+          f.strategy = kLeveled;
           new_files_.push_back(std::make_pair(level, f));
         } else {
           msg = "new-file entry";
         }
         break;
+
+      case kFileStrategy: {
+        uint64_t strategy_file_number;
+        uint32_t strategy_value;
+        if (GetVarint64(&input, &strategy_file_number) &&
+            GetVarint32(&input, &strategy_value)) {
+          if (!new_files_.empty() &&
+              new_files_.back().second.number == strategy_file_number) {
+            new_files_.back().second.strategy =
+                static_cast<Strategy>(strategy_value);
+          } else {
+            msg = "file strategy for unrecognized file";
+          }
+        } else {
+          msg = "file strategy";
+        }
+        break;
+      }
 
       default:
         msg = "unknown tag";

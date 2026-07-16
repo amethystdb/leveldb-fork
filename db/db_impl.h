@@ -9,10 +9,12 @@
 #include <deque>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
+#include "db/version_edit.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "port/port.h"
@@ -70,6 +72,33 @@ class DBImpl : public DB {
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
   void RecordReadSample(Slice key);
+
+  // Test-only: rewrite a file's persisted strategy tag via a normal
+  // LogAndApply (RemoveFile+AddFile with the same number/size/range),
+  // without touching the underlying SSTable bytes. Exercises the real
+  // MANIFEST persistence path rather than mutating in-memory state.
+  Status TEST_SetFileStrategy(int level, uint64_t file_number,
+                               Strategy strategy);
+
+  // Test-only: current strategy tag for a file. Sets *found = false (and
+  // returns kTiered) if no such file exists at that level.
+  Strategy TEST_GetFileStrategy(int level, uint64_t file_number, bool* found);
+
+  // Test-only: file numbers currently present at the given level.
+  std::vector<uint64_t> TEST_FileNumbersAtLevel(int level);
+
+  // Test-only: allocate a fresh file number, for constructing hand-built
+  // SSTables that are then registered via TEST_AddFile.
+  uint64_t TEST_NewFileNumber();
+
+  // Test-only: register a file (whose bytes must already exist on disk,
+  // e.g. hand-built with a TableBuilder) into the current version via a
+  // normal LogAndApply. Used to construct states that ordinary compaction
+  // cannot yet produce (e.g. genuinely-overlapping tiered runs), so the
+  // read path can be tested ahead of Phase 3.
+  Status TEST_AddFile(int level, uint64_t file_number, uint64_t file_size,
+                       const InternalKey& smallest, const InternalKey& largest,
+                       Strategy strategy);
 
  private:
   friend class DB;

@@ -270,6 +270,16 @@ class VersionSet {
   };
   const char* LevelSummary(LevelSummaryStorage* scratch) const;
 
+  // Test-only: file numbers currently present at the given level, in
+  // Version order.
+  void TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const;
+
+  // Test-only: find a file's metadata by (level, file number) in the
+  // current version. Returns nullptr if not present. The returned
+  // pointer is only valid while holding the DB mutex and while no
+  // compaction has replaced the file.
+  const FileMetaData* TEST_FindFile(int level, uint64_t file_number) const;
+
  private:
   class Builder;
 
@@ -373,6 +383,13 @@ class Compaction {
   uint64_t max_output_file_size_;
   Version* input_version_;
   VersionEdit edit_;
+
+  // True only for the adaptive-controller-driven strategy-switch
+  // compaction, which explicitly assigns target_strategy_ to the new
+  // strategy. Ordinary compactions leave this false so that
+  // VersionSet::SetupOtherInputs knows to inherit target_strategy_ from
+  // the primary input instead of leaving it at the Compaction default.
+  bool strategy_locked_;
 
   // Each compaction reads inputs from "level_" and "level_+1"
   std::vector<FileMetaData*> inputs_[2];  // The two sets of inputs

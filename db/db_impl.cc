@@ -1191,6 +1191,65 @@ void DBImpl::RecordReadSample(Slice key) {
   }
 }
 
+Status DBImpl::TEST_SetFileStrategy(int level, uint64_t file_number,
+                                     Strategy strategy) {
+  MutexLock l(&mutex_);
+  const FileMetaData* f = versions_->TEST_FindFile(level, file_number);
+  if (f == nullptr) {
+    return Status::NotFound("no such file at that level");
+  }
+  uint64_t file_size = f->file_size;
+  InternalKey smallest = f->smallest;
+  InternalKey largest = f->largest;
+
+  // Applied as two separate LogAndApply calls rather than one
+  // RemoveFile+AddFile edit: VersionSet::Builder::Apply processes an
+  // edit's deleted_files before its new_files, and a new_files entry
+  // erases its own file number from deleted_files -- so a same-level
+  // remove+add of the same file number within a single edit cancels
+  // out, leaving both the old and new metadata entries in the level
+  // (a duplicate, overlapping range that trips the level invariant).
+  VersionEdit remove_edit;
+  remove_edit.RemoveFile(level, file_number);
+  Status s = versions_->LogAndApply(&remove_edit, &mutex_);
+  if (!s.ok()) {
+    return s;
+  }
+
+  VersionEdit add_edit;
+  add_edit.AddFile(level, file_number, file_size, smallest, largest, strategy);
+  return versions_->LogAndApply(&add_edit, &mutex_);
+}
+
+Strategy DBImpl::TEST_GetFileStrategy(int level, uint64_t file_number,
+                                       bool* found) {
+  MutexLock l(&mutex_);
+  const FileMetaData* f = versions_->TEST_FindFile(level, file_number);
+  *found = (f != nullptr);
+  return (f != nullptr) ? f->strategy : kTiered;
+}
+
+std::vector<uint64_t> DBImpl::TEST_FileNumbersAtLevel(int level) {
+  MutexLock l(&mutex_);
+  std::vector<uint64_t> result;
+  versions_->TEST_FileNumbers(level, &result);
+  return result;
+}
+
+uint64_t DBImpl::TEST_NewFileNumber() {
+  MutexLock l(&mutex_);
+  return versions_->NewFileNumber();
+}
+
+Status DBImpl::TEST_AddFile(int level, uint64_t file_number,
+                             uint64_t file_size, const InternalKey& smallest,
+                             const InternalKey& largest, Strategy strategy) {
+  MutexLock l(&mutex_);
+  VersionEdit edit;
+  edit.AddFile(level, file_number, file_size, smallest, largest, strategy);
+  return versions_->LogAndApply(&edit, &mutex_);
+}
+
 const Snapshot* DBImpl::GetSnapshot() {
   MutexLock l(&mutex_);
   return snapshots_.New(versions_->LastSequence());

@@ -17,6 +17,7 @@
 #include "leveldb/env.h"
 #include "leveldb/filter_policy.h"
 #include "leveldb/table.h"
+#include "leveldb/table_builder.h"
 #include "port/port.h"
 #include "port/thread_annotations.h"
 #include "util/hash.h"
@@ -37,6 +38,30 @@ static std::string RandomKey(Random* rnd) {
       (rnd->OneIn(3) ? 1  // Short sometimes to encourage collisions
                      : (rnd->OneIn(100) ? rnd->Skewed(10) : rnd->Uniform(10)));
   return test::RandomKey(rnd, len);
+}
+
+// Hand-builds a single-entry SSTable at `fname`, containing exactly the
+// given already-encoded internal key. Used to construct SSTable layouts
+// (e.g. genuinely-overlapping tiered runs) that ordinary compaction
+// cannot yet produce, so the read path can be tested ahead of Phase 3.
+static Status BuildOneEntryTable(Env* env, const Options& options,
+                                 const std::string& fname,
+                                 const InternalKey& ikey,
+                                 const std::string& value) {
+  WritableFile* file;
+  Status s = env->NewWritableFile(fname, &file);
+  if (!s.ok()) return s;
+  TableBuilder builder(options, file);
+  builder.Add(ikey.Encode(), value);
+  s = builder.Finish();
+  if (s.ok()) {
+    s = file->Sync();
+  }
+  if (s.ok()) {
+    s = file->Close();
+  }
+  delete file;
+  return s;
 }
 
 namespace {
@@ -2355,6 +2380,158 @@ TEST_F(DBTest, Randomized) {
     if (model_snap != nullptr) model.ReleaseSnapshot(model_snap);
     if (db_snap != nullptr) db_->ReleaseSnapshot(db_snap);
   } while (ChangeOptions());
+}
+
+// --- Amethyst Phase 1 correctness tests ---
+//
+// These cover the three bugs found in Phase 0:
+//  (1) Compaction::target_strategy_ silently resetting to kTiered on any
+//      ordinary (non-adaptive) compaction, even a trivial move that
+//      never rewrites the file at all.
+//  (2) The strategy tag not surviving the MANIFEST encode/decode
+//      round trip (VersionEdit::EncodeTo/DecodeFrom, WriteSnapshot).
+//  (3) The tiered read fallback resolving overlapping candidates by
+//      file/list order (or by a file-number recency proxy) instead of by
+//      actual sequence number.
+
+TEST_F(DBTest, StrategySurvivesOrdinaryCompactionAndReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.write_buffer_size = 100000;  // Small buffer for deterministic flushes
+  DestroyAndReopen(&options);
+
+  // Write one file's worth of data. On a fresh, empty DB,
+  // PickLevelForMemTableOutput may push the flushed file straight past
+  // level 0 (up to kMaxMemCompactLevel) since there's nothing to overlap
+  // -- so find wherever it actually landed instead of assuming L0/L1.
+  Random rnd(301);
+  for (int i = 0; i < 200; i++) {
+    ASSERT_LEVELDB_OK(Put(Key(i), RandomString(&rnd, 200)));
+  }
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+
+  int source_level = -1;
+  for (int level = 0; level < config::kNumLevels - 1; level++) {
+    if (NumTableFilesAtLevel(level) > 0) {
+      source_level = level;
+      break;
+    }
+  }
+  ASSERT_GE(source_level, 0) << "flushed file not found at any level";
+
+  std::vector<uint64_t> source_files =
+      dbfull()->TEST_FileNumbersAtLevel(source_level);
+  ASSERT_EQ(1u, source_files.size());
+  uint64_t target_file = source_files[0];
+
+  // Flip it to kLeveled via a normal LogAndApply -- the same MANIFEST
+  // path a real strategy switch would use -- independent of the
+  // adaptive controller's EMA timing.
+  ASSERT_LEVELDB_OK(
+      dbfull()->TEST_SetFileStrategy(source_level, target_file, kLeveled));
+  bool found = false;
+  ASSERT_EQ(kLeveled,
+            dbfull()->TEST_GetFileStrategy(source_level, target_file, &found));
+  ASSERT_TRUE(found);
+
+  // Trigger an ORDINARY (non-adaptive) compaction that sweeps this file
+  // up as one of its normal inputs. TEST_CompactRange goes through
+  // VersionSet::CompactRange, never PickCompaction's adaptive-rewrite
+  // branch, so this exercises the "ordinary compaction" path exactly.
+  // Before the fix, this would silently reset the output's strategy to
+  // the Compaction default (kTiered).
+  dbfull()->TEST_CompactRange(source_level, nullptr, nullptr);
+  ASSERT_EQ(NumTableFilesAtLevel(source_level), 0);
+  int dest_level = source_level + 1;
+  std::vector<uint64_t> dest_files =
+      dbfull()->TEST_FileNumbersAtLevel(dest_level);
+  ASSERT_FALSE(dest_files.empty());
+  for (uint64_t number : dest_files) {
+    found = false;
+    Strategy s = dbfull()->TEST_GetFileStrategy(dest_level, number, &found);
+    ASSERT_TRUE(found);
+    EXPECT_EQ(kLeveled, s) << "strategy did not survive an ordinary compaction";
+  }
+
+  // Close and reopen: the strategy tag must also survive the MANIFEST
+  // round trip.
+  Reopen(&options);
+  std::vector<uint64_t> dest_files_after_reopen =
+      dbfull()->TEST_FileNumbersAtLevel(dest_level);
+  ASSERT_EQ(dest_files, dest_files_after_reopen)
+      << "file identities changed across reopen; test assumptions invalid";
+  for (uint64_t number : dest_files_after_reopen) {
+    found = false;
+    Strategy s = dbfull()->TEST_GetFileStrategy(dest_level, number, &found);
+    ASSERT_TRUE(found);
+    EXPECT_EQ(kLeveled, s) << "strategy did not survive MANIFEST reopen";
+  }
+}
+
+TEST_F(DBTest, TieredOverlapResolvesByNewestSequenceNotFileNumber) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(&options);
+
+  // A no-snapshot Get uses versions_->LastSequence() as its implicit
+  // snapshot, hiding any entry whose sequence number is above it. Bump
+  // last_sequence_ (via real, sequence-consuming Puts) comfortably above
+  // the hand-picked sequence numbers used below, so both candidate
+  // entries are within that snapshot's visibility.
+  for (int i = 0; i < 10; i++) {
+    ASSERT_LEVELDB_OK(Put("zzz_warmup", "x"));
+  }
+
+  const std::string key = "adversarial_key";
+  InternalKey ikey_new(key, /*seq=*/8, kTypeValue);
+  InternalKey ikey_old(key, /*seq=*/2, kTypeValue);
+
+  // Real SSTables are always built with the comparator wrapped in an
+  // InternalKeyComparator (see DBImpl's SanitizeOptions) so that the
+  // index block's separator-shortening logic understands the trailing
+  // 8-byte (sequence, type) tag and never truncates a key below it.
+  // Building with the plain user comparator instead corrupts the index
+  // key and trips ExtractUserKey's size assertion on read-back.
+  InternalKeyComparator icmp(options.comparator);
+  Options table_options = options;
+  table_options.comparator = &icmp;
+
+  // File A gets the LOWER file number but holds the NEWER sequence
+  // number for the same key -- the adversarial case that breaks any
+  // resolution mechanism relying on "higher file number implies newer
+  // data" as a proxy instead of actually comparing sequence numbers.
+  uint64_t file_a_number = dbfull()->TEST_NewFileNumber();
+  ASSERT_LEVELDB_OK(BuildOneEntryTable(env_, table_options,
+                                       TableFileName(dbname_, file_a_number),
+                                       ikey_new, "value_from_newer_seq"));
+
+  uint64_t file_b_number = dbfull()->TEST_NewFileNumber();
+  ASSERT_LEVELDB_OK(BuildOneEntryTable(env_, table_options,
+                                       TableFileName(dbname_, file_b_number),
+                                       ikey_old, "value_from_older_seq"));
+
+  ASSERT_LT(file_a_number, file_b_number);
+
+  uint64_t file_a_size = 0, file_b_size = 0;
+  ASSERT_LEVELDB_OK(
+      env_->GetFileSize(TableFileName(dbname_, file_a_number), &file_a_size));
+  ASSERT_LEVELDB_OK(
+      env_->GetFileSize(TableFileName(dbname_, file_b_number), &file_b_size));
+
+  // Register both at the SAME level with OVERLAPPING (identical,
+  // single-key) ranges, tagged kTiered -- the state real tiered
+  // accumulation is supposed to eventually produce at L1+.
+  ASSERT_LEVELDB_OK(dbfull()->TEST_AddFile(1, file_a_number, file_a_size,
+                                           ikey_new, ikey_new, kTiered));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_AddFile(1, file_b_number, file_b_size,
+                                           ikey_old, ikey_old, kTiered));
+
+  std::string value;
+  ASSERT_LEVELDB_OK(db_->Get(ReadOptions(), key, &value));
+  EXPECT_EQ("value_from_newer_seq", value)
+      << "Get returned the stale (lower-sequence) value instead of "
+         "resolving overlapping tiered candidates by actual sequence "
+         "number.";
 }
 
 }  // namespace leveldb

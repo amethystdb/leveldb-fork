@@ -257,6 +257,7 @@ struct Saver {
   const Comparator* ucmp;
   Slice user_key;
   std::string* value;
+  SequenceNumber sequence;  // valid whenever state != kNotFound
 };
 }  // namespace
 static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
@@ -267,6 +268,7 @@ static void SaveValue(void* arg, const Slice& ikey, const Slice& v) {
   } else {
     if (s->ucmp->Compare(parsed_key.user_key, s->user_key) == 0) {
       s->state = (parsed_key.type == kTypeValue) ? kFound : kDeleted;
+      s->sequence = parsed_key.sequence;
       if (s->state == kFound) {
         s->value->assign(v.data(), v.size());
       }
@@ -358,6 +360,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
 
   struct State {
     Saver saver;
+    std::string scratch;  // backing store for saver.value; see below
     GetStats* stats;
     const ReadOptions* options;
     Slice ikey;
@@ -368,8 +371,29 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
     Status s;
     bool found;
 
+    // Resolves multiple candidate files that overlap this user_key within
+    // the SAME level -- which normally only happens at L0, but is also
+    // how a genuinely-overlapping tiered level must be resolved -- by the
+    // actual sequence number found in each file, not by file/list order.
+    // Cross-level short-circuiting (stop once any shallower level
+    // answers) remains valid and is preserved: a key at a shallower
+    // level is always newer than any copy at a deeper level under the
+    // ordinary LSM compaction invariant, independent of tiering.
+    bool have_candidate;
+    int candidate_level;
+    SequenceNumber best_sequence;
+    bool best_is_deleted;
+    FileMetaData* best_file;
+    std::string best_value;
+
     static bool Match(void* arg, int level, FileMetaData* f) {
       State* state = reinterpret_cast<State*>(arg);
+
+      if (state->have_candidate && level != state->candidate_level) {
+        // Everything left is at a deeper level than our best candidate,
+        // hence guaranteed older. Stop without reading it.
+        return false;
+      }
 
       if (state->stats->seek_file == nullptr &&
           state->last_file_read != nullptr) {
@@ -381,6 +405,7 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
       state->last_file_read = f;
       state->last_file_read_level = level;
 
+      state->saver.state = kNotFound;  // discard any earlier file's result
       state->s = state->vset->table_cache_->Get(*state->options, f->number,
                                                 f->file_size, state->ikey,
                                                 &state->saver, SaveValue);
@@ -392,11 +417,21 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
         case kNotFound:
           return true;  // Keep searching in other files
         case kFound:
-          state->found = true;
-          f->readCount.fetch_add(1, std::memory_order_relaxed);
-          return false;
         case kDeleted:
-          return false;
+          if (!state->have_candidate ||
+              state->saver.sequence > state->best_sequence) {
+            state->have_candidate = true;
+            state->candidate_level = level;
+            state->best_sequence = state->saver.sequence;
+            state->best_is_deleted = (state->saver.state == kDeleted);
+            state->best_file = f;
+            if (state->saver.state == kFound) {
+              state->best_value = state->scratch;
+            }
+          }
+          // Keep scanning: another file overlapping this same level might
+          // hold an even newer sequence number for this key.
+          return true;
         case kCorrupt:
           state->s =
               Status::Corruption("corrupted key for ", state->saver.user_key);
@@ -423,9 +458,25 @@ Status Version::Get(const ReadOptions& options, const LookupKey& k,
   state.saver.state = kNotFound;
   state.saver.ucmp = vset_->icmp_.user_comparator();
   state.saver.user_key = k.user_key();
-  state.saver.value = value;
+  state.saver.value = &state.scratch;
+
+  state.have_candidate = false;
+  state.candidate_level = -1;
+  state.best_sequence = 0;
+  state.best_is_deleted = false;
+  state.best_file = nullptr;
 
   ForEachOverlapping(state.saver.user_key, state.ikey, &state, &State::Match);
+
+  if (state.s.ok() && !state.found && state.have_candidate) {
+    // We exhausted every candidate level without hitting an error; the
+    // winning candidate accumulated above is the real answer.
+    if (!state.best_is_deleted) {
+      *value = state.best_value;
+      state.found = true;
+      state.best_file->readCount.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
 
   return state.found ? state.s : Status::NotFound(Slice());
 }
@@ -1118,7 +1169,8 @@ Status VersionSet::WriteSnapshot(log::Writer* log) {
     const std::vector<FileMetaData*>& files = current_->files_[level];
     for (size_t i = 0; i < files.size(); i++) {
       const FileMetaData* f = files[i];
-      edit.AddFile(level, f->number, f->file_size, f->smallest, f->largest);
+      edit.AddFile(level, f->number, f->file_size, f->smallest, f->largest,
+                   f->strategy);
     }
   }
 
@@ -1143,6 +1195,20 @@ const char* VersionSet::LevelSummary(LevelSummaryStorage* scratch) const {
       int(current_->files_[4].size()), int(current_->files_[5].size()),
       int(current_->files_[6].size()));
   return scratch->buffer;
+}
+
+void VersionSet::TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const {
+  numbers->clear();
+  for (FileMetaData* f : current_->files_[level]) {
+    numbers->push_back(f->number);
+  }
+}
+
+const FileMetaData* VersionSet::TEST_FindFile(int level, uint64_t file_number) const {
+  for (FileMetaData* f : current_->files_[level]) {
+    if (f->number == file_number) return f;
+  }
+  return nullptr;
 }
 
 uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
@@ -1305,6 +1371,7 @@ Compaction* VersionSet::PickCompaction() {
         c = new Compaction(options_, level);
         c->inputs_[0].push_back(f);
         c->target_strategy_ = target_strategy;
+        c->strategy_locked_ = true;
         c->input_version_ = current_;
         c->input_version_->Ref();
 
@@ -1496,6 +1563,23 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
     }
   }
 
+  // Ordinary compactions (size-triggered, seek-triggered, manual
+  // CompactRange) must not silently reset a file's strategy tag back to
+  // the Compaction default (kTiered). Instead they inherit it from the
+  // primary input (inputs_[0], the files at the shallower "level"). Only
+  // the adaptive-controller strategy-switch compaction (PickCompaction)
+  // deliberately assigns a *new* target_strategy_, and it marks
+  // strategy_locked_ so it is left alone here.
+  //
+  // KNOWN WART: inputs_[0] can hold more than one file (L0 overlap
+  // expansion, or the expanded0 growth above), and those files could in
+  // principle carry different strategy tags. We take the first file as
+  // representative rather than trying to reconcile a per-file strategy
+  // across a multi-file primary input.
+  if (!c->strategy_locked_) {
+    c->target_strategy_ = c->inputs_[0][0]->strategy;
+  }
+
   // Compute the set of grandparent files that overlap this compaction
   // (parent == level+1; grandparent == level+2)
   if (level + 2 < config::kNumLevels) {
@@ -1551,7 +1635,8 @@ Compaction::Compaction(const Options* options, int level)
       grandparent_index_(0),
       seen_key_(false),
       overlapped_bytes_(0),
-      target_strategy_(kTiered) {
+      target_strategy_(kTiered),
+      strategy_locked_(false) {
   for (int i = 0; i < config::kNumLevels; i++) {
     level_ptrs_[i] = 0;
   }
