@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -154,11 +156,18 @@ DBImpl::~DBImpl() {
   // taking mutex_ below: if it were joined while mutex_ is held, a poll
   // that's blocked acquiring that same mutex inside
   // MaybeScheduleAdaptiveCheck would deadlock against this join. Setting
-  // the flag first lets it notice shutting_down_ (either before locking,
-  // or under the lock via its own re-check) and exit on its own; only
-  // once it has fully exited do we know it can't schedule new work
-  // during the drain-wait below.
+  // the flag first lets it notice shutting_down_ (either immediately via
+  // the notify below, or under mutex_ via its own re-check) and exit on
+  // its own; only once it has fully exited do we know it can't schedule
+  // new work during the drain-wait below.
   shutting_down_.store(true, std::memory_order_release);
+  {
+    // Notify under periodic_poll_mutex_ so the wakeup can't be lost in
+    // the narrow window between the poll thread checking shutting_down_
+    // and actually entering its wait -- see PeriodicAdaptiveCheckLoop.
+    std::lock_guard<std::mutex> lock(periodic_poll_mutex_);
+    periodic_poll_cv_.notify_one();
+  }
   if (periodic_poll_thread_.joinable()) {
     periodic_poll_thread_.join();
   }
@@ -714,21 +723,19 @@ void DBImpl::MaybeScheduleAdaptiveCheck() {
 }
 
 void DBImpl::PeriodicAdaptiveCheckLoop() {
-  const int kShutdownCheckSliceMicros = 250 * 1000;  // Hardcoded; see below.
-  const int poll_interval_micros = options_.adaptive_poll_interval_ms * 1000;
+  const auto interval =
+      std::chrono::milliseconds(options_.adaptive_poll_interval_ms);
 
+  std::unique_lock<std::mutex> lock(periodic_poll_mutex_);
   while (true) {
-    // Sleep in short, fixed slices (rather than one long sleep for
-    // options_.adaptive_poll_interval_ms) so shutdown latency stays
-    // bounded to this slice instead of the full research-tunable
-    // cadence above.
-    for (int waited = 0; waited < poll_interval_micros;
-         waited += kShutdownCheckSliceMicros) {
-      if (shutting_down_.load(std::memory_order_acquire)) {
-        return;
-      }
-      env_->SleepForMicroseconds(kShutdownCheckSliceMicros);
-    }
+    // Interruptible timed wait: returns as soon as the predicate becomes
+    // true (shutdown, woken immediately by ~DBImpl's notify) or after
+    // `interval` elapses with the predicate still false (time for a
+    // poll). This replaces short fixed sleep slices, so shutdown latency
+    // is microseconds instead of up to a slice length.
+    periodic_poll_cv_.wait_for(lock, interval, [this] {
+      return shutting_down_.load(std::memory_order_acquire);
+    });
     if (shutting_down_.load(std::memory_order_acquire)) {
       return;
     }
@@ -738,8 +745,12 @@ void DBImpl::PeriodicAdaptiveCheckLoop() {
     // of write pressure) but not the per-file readCount reset on every
     // compaction, so weak/slow kLeveled promotion may still occur until
     // region-keyed counters (Phase 4) land.
-    MutexLock l(&mutex_);
-    MaybeScheduleAdaptiveCheck();
+    lock.unlock();
+    {
+      MutexLock l(&mutex_);
+      MaybeScheduleAdaptiveCheck();
+    }
+    lock.lock();
   }
 }
 

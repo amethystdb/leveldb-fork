@@ -6,7 +6,9 @@
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -243,6 +245,14 @@ class DBImpl : public DB {
   // timer (see PeriodicAdaptiveCheckLoop). Started at the end of a
   // successful DB::Open, joined in ~DBImpl before mutex_ is taken for
   // the pre-existing compaction-drain wait.
+  //
+  // periodic_poll_mutex_/periodic_poll_cv_ are a dedicated std::mutex +
+  // std::condition_variable for this thread's interruptible timed wait
+  // -- deliberately NOT mutex_/background_work_finished_signal_, so
+  // ~DBImpl can wake it immediately on shutdown without contending with
+  // (or being ordered by) unrelated DB state.
+  std::mutex periodic_poll_mutex_;
+  std::condition_variable periodic_poll_cv_;
   std::thread periodic_poll_thread_;
 
   ManualCompaction* manual_compaction_ GUARDED_BY(mutex_);
