@@ -103,6 +103,18 @@ class DBImpl : public DB {
                        const InternalKey& smallest, const InternalKey& largest,
                        Strategy strategy);
 
+  // Test-only: runs a Compaction exactly as the adaptive-rewrite path
+  // would (explicit target_strategy_, strategy_locked_ = true) through
+  // SetupOtherInputs, to verify Phase 3's reordering didn't break the
+  // strategy_locked_ guard. Returns false if no such file exists.
+  bool TEST_RunLockedCompaction(int level, uint64_t file_number,
+                                Strategy explicit_target,
+                                Strategy* result_strategy,
+                                bool* inputs1_empty);
+
+  // Test-only: see VersionSet::TEST_IsBaseLevelForKey.
+  bool TEST_IsBaseLevelForKey(int compaction_level, const Slice& user_key);
+
  private:
   friend class DB;
   struct CompactionState;

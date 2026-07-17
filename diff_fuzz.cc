@@ -4,6 +4,14 @@
 // version counter so staleness is directly observable, not just
 // presence/absence.
 //
+// Also periodically does a full DB::NewIterator() range scan compared
+// against the shadow map's sorted contents (a merge-walk: catches missing
+// keys, extra/resurrected keys, and stale values in scan order). Point
+// Get() checks and this range-scan path exercise genuinely different code
+// (Version::Get vs. Version::AddIterators/NewConcatenatingIterator) --
+// the latter was NOT touched by Phase 1's sequence-number resolution fix,
+// so this is the only guardrail covering it.
+//
 // Public API only. PASS/FAIL via exit code. Note: this only exercises the
 // tiered overlapping-run resolution path if overlap_check reports REAL
 // tiering; against a COSMETIC implementation it mostly re-validates
@@ -18,6 +26,7 @@
 #include <string>
 
 #include "leveldb/db.h"
+#include "leveldb/iterator.h"
 #include "leveldb/options.h"
 
 namespace {
@@ -58,6 +67,11 @@ int main(int argc, char** argv) {
   options.compression = leveldb::kNoCompression;
   options.write_buffer_size = 1 * 1024 * 1024;  // 1MB
   options.max_file_size = 512 * 1024;           // 512KB
+  // AMETHYST: adaptive_enabled defaults to false as of Phase 3. This
+  // diagnostic exists specifically to catch stale/incorrect reads from
+  // genuinely overlapping tiered runs, so it opts in explicitly -- with
+  // it off, this would only ever re-validate stock LevelDB.
+  options.adaptive_enabled = true;
 
   leveldb::DestroyDB(dbname, options);
 
@@ -72,6 +86,7 @@ int main(int argc, char** argv) {
   const int kNumOps = 200000;
   const int kValueSize = 150;
   const int kCheckEvery = 5;
+  const int kScanCheckEvery = 20000;
 
   std::mt19937 rng(seed);
   std::uniform_int_distribution<int> key_dist(0, kKeyspace - 1);
@@ -83,6 +98,8 @@ int main(int argc, char** argv) {
   long long version_counter = 0;
   long long checks = 0;
   long long mismatches = 0;
+  long long scan_checks = 0;
+  long long scan_mismatches = 0;
   const int kMaxPrinted = 20;
 
   leveldb::WriteOptions wopts;
@@ -131,6 +148,73 @@ int main(int argc, char** argv) {
     }
   };
 
+  // Full range scan vs. the shadow map's sorted contents, via a
+  // merge-walk: catches keys the iterator skips (stale shadowing hid a
+  // live key), keys it produces that shadow doesn't have (a dropped
+  // tombstone resurrected an old value), and keys present in both but
+  // with a stale/wrong value.
+  auto check_full_scan = [&]() {
+    leveldb::Iterator* iter = db->NewIterator(ropts);
+    iter->SeekToFirst();
+    auto shadow_it = shadow.begin();
+    while (iter->Valid() || shadow_it != shadow.end()) {
+      scan_checks++;
+      if (!iter->Valid()) {
+        mismatches++;
+        scan_mismatches++;
+        if (scan_mismatches <= kMaxPrinted) {
+          std::fprintf(stderr,
+                       "SCAN MISMATCH: shadow has key=%s but iterator "
+                       "exhausted -- MISSING KEY IN SCAN\n",
+                       shadow_it->first.c_str());
+        }
+        ++shadow_it;
+        continue;
+      }
+      std::string ikey = iter->key().ToString();
+      if (shadow_it == shadow.end() || ikey < shadow_it->first) {
+        mismatches++;
+        scan_mismatches++;
+        if (scan_mismatches <= kMaxPrinted) {
+          std::fprintf(stderr,
+                       "SCAN MISMATCH: iterator produced key=%s not in "
+                       "shadow -- RESURRECTED KEY\n",
+                       ikey.c_str());
+        }
+        iter->Next();
+        continue;
+      }
+      if (ikey > shadow_it->first) {
+        mismatches++;
+        scan_mismatches++;
+        if (scan_mismatches <= kMaxPrinted) {
+          std::fprintf(stderr,
+                       "SCAN MISMATCH: shadow has key=%s but iterator "
+                       "skipped past it to key=%s -- MISSING KEY IN SCAN\n",
+                       shadow_it->first.c_str(), ikey.c_str());
+        }
+        ++shadow_it;
+        continue;
+      }
+      // Keys match; check the value.
+      long long got_version = -1;
+      bool parsed = ParseVersion(iter->value().ToString(), &got_version);
+      if (!parsed || got_version != shadow_it->second) {
+        mismatches++;
+        scan_mismatches++;
+        if (scan_mismatches <= kMaxPrinted) {
+          std::fprintf(stderr,
+                       "SCAN MISMATCH key=%s expected_version=%lld "
+                       "actual_version=%lld (parsed=%d) -- STALE READ IN SCAN\n",
+                       ikey.c_str(), shadow_it->second, got_version, parsed);
+        }
+      }
+      iter->Next();
+      ++shadow_it;
+    }
+    delete iter;
+  };
+
   for (int i = 0; i < kNumOps; i++) {
     int k = key_dist(rng);
     std::string key = "key" + ZeroPad(k, 7);
@@ -157,17 +241,28 @@ int main(int argc, char** argv) {
       int ck = key_dist(rng);
       check_key("key" + ZeroPad(ck, 7));
     }
+
+    if (i > 0 && i % kScanCheckEvery == 0) {
+      check_full_scan();
+    }
   }
 
-  std::printf("Randomized loop done: %d ops, %lld checks so far, %lld mismatches so far.\n",
-              kNumOps, checks, mismatches);
+  std::printf(
+      "Randomized loop done: %d ops, %lld point checks (%lld mismatches), "
+      "%lld scan checks (%lld mismatches) so far.\n",
+      kNumOps, checks, mismatches, scan_checks, scan_mismatches);
 
-  // Final full sweep over the entire bounded keyspace.
+  // Final full sweep over the entire bounded keyspace, plus a final range
+  // scan.
   for (int k = 0; k < kKeyspace; k++) {
     check_key("key" + ZeroPad(k, 7));
   }
+  check_full_scan();
 
-  std::printf("Final: checks=%lld mismatches=%lld\n", checks, mismatches);
+  std::printf(
+      "Final: point checks=%lld (mismatches=%lld) scan checks=%lld "
+      "(mismatches=%lld)\n",
+      checks, mismatches, scan_checks, scan_mismatches);
 
   delete db;
 

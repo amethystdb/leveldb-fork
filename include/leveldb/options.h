@@ -155,11 +155,29 @@ struct LEVELDB_EXPORT Options {
   int adaptive_poll_interval_ms = 2500;
 
   // AMETHYST: master switch for the adaptive engine. When false, no
-  // periodic poll thread is spawned and PickCompaction's adaptive-rewrite
-  // check is skipped entirely, so the engine's compaction scheduling is
-  // that of stock LevelDB -- this is the stock-baseline mode used for
-  // apples-to-apples benchmark comparisons within this fork.
-  bool adaptive_enabled = true;
+  // periodic poll thread is spawned, PickCompaction's adaptive-rewrite
+  // check is skipped entirely, and (Phase 3) no level is ever allowed to
+  // accumulate overlapping tiered runs -- so the engine's compaction
+  // scheduling is that of stock LevelDB. This is the stock-baseline mode
+  // used for apples-to-apples benchmark comparisons within this fork.
+  //
+  // Defaults to false as of Phase 3. Every FileMetaData defaults to
+  // kTiered (a pre-existing default, harmless while tiering was
+  // cosmetic), so once accumulation is real, defaulting this to true
+  // would make every DB in this fork -- including the entire stock
+  // LevelDB test suite, which never opts into Amethyst -- silently
+  // accumulate overlapping runs at level 1 instead of flattening like
+  // stock. An experimental feature that changes fundamental compaction
+  // behavior should be opt-in, not opt-out.
+  bool adaptive_enabled = false;
+
+  // AMETHYST: number of same-level kTiered runs a level may accumulate
+  // (Phase 3 first cut: level 1 only -- see LevelAllowsTieredAccumulation
+  // in version_set.cc) before the next PickCompaction batch-merges all of
+  // them down into the next level. This is the research knob we'll sweep
+  // for the paper; it maps to Fluid LSM's K parameter. Run-count only in
+  // this first cut, no size-based trigger.
+  int tiered_batch_merge_run_threshold = 4;
 };
 
 // Options that control read operations

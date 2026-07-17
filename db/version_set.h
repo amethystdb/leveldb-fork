@@ -286,6 +286,30 @@ class VersionSet {
   // compaction has replaced the file.
   const FileMetaData* TEST_FindFile(int level, uint64_t file_number) const;
 
+  // Test-only: constructs a Compaction exactly as PickCompaction's
+  // adaptive-rewrite branch does (single seed file at `level`, explicit
+  // target_strategy_ = `explicit_target`, strategy_locked_ = true), runs
+  // it through SetupOtherInputs, and reports the resulting
+  // target_strategy_ plus whether inputs_[1] ended up empty
+  // (accumulated) or populated (merged normally). Verifies
+  // strategy_locked_ still protects an explicit adaptive-rewrite choice
+  // from SetupOtherInputs's inheritance line, regardless of where in the
+  // function that guard is checked. Returns false if no file with
+  // `file_number` exists at `level`.
+  bool TEST_RunLockedCompaction(int level, uint64_t file_number,
+                                Strategy explicit_target,
+                                Strategy* result_strategy,
+                                bool* inputs1_empty);
+
+  // Test-only: constructs a Compaction with the given level_ against the
+  // current version (no real inputs needed -- IsBaseLevelForKey only
+  // uses input_version_/level_/level_ptrs_) and returns
+  // IsBaseLevelForKey(user_key). Exercises the level-contains-tiered
+  // guard directly, including states (overlapping tiered runs at a
+  // level >= compaction_level+2) that real compaction can't yet produce
+  // at Phase 3's level-1-only accumulation scope.
+  bool TEST_IsBaseLevelForKey(int compaction_level, const Slice& user_key);
+
  private:
   class Builder;
 
@@ -396,6 +420,20 @@ class Compaction {
   // VersionSet::SetupOtherInputs knows to inherit target_strategy_ from
   // the primary input instead of leaving it at the Compaction default.
   bool strategy_locked_;
+
+  // AMETHYST Phase 3: true iff SetupOtherInputs left inputs_[1] empty
+  // because this compaction is accumulating a new standalone tiered run
+  // at level_+1 rather than merging into what's already there. Normally
+  // IsBaseLevelForKey skips level_+1 (starts at level_+2) because
+  // whatever's there is assumed to already be part of inputs_[1] and
+  // thus reconciled by this same merge pass -- accumulation breaks that
+  // assumption, since existing runs at level_+1 are deliberately left
+  // untouched. Without this flag, a tombstone produced by one
+  // accumulate-mode compaction could be dropped as "no deeper copy
+  // exists" while an older live value for the same key still sits in a
+  // sibling run at level_+1 that this compaction never looked at --
+  // silently resurrecting it.
+  bool accumulated_;
 
   // Each compaction reads inputs from "level_" and "level_+1"
   std::vector<FileMetaData*> inputs_[2];  // The two sets of inputs

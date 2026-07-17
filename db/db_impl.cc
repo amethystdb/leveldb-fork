@@ -1322,6 +1322,21 @@ Status DBImpl::TEST_AddFile(int level, uint64_t file_number,
   return versions_->LogAndApply(&edit, &mutex_);
 }
 
+bool DBImpl::TEST_RunLockedCompaction(int level, uint64_t file_number,
+                                      Strategy explicit_target,
+                                      Strategy* result_strategy,
+                                      bool* inputs1_empty) {
+  MutexLock l(&mutex_);
+  return versions_->TEST_RunLockedCompaction(
+      level, file_number, explicit_target, result_strategy, inputs1_empty);
+}
+
+bool DBImpl::TEST_IsBaseLevelForKey(int compaction_level,
+                                    const Slice& user_key) {
+  MutexLock l(&mutex_);
+  return versions_->TEST_IsBaseLevelForKey(compaction_level, user_key);
+}
+
 const Snapshot* DBImpl::GetSnapshot() {
   MutexLock l(&mutex_);
   return snapshots_.New(versions_->LastSequence());

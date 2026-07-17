@@ -64,6 +64,52 @@ static int64_t TotalFileSize(const std::vector<FileMetaData*>& files) {
   return sum;
 }
 
+// AMETHYST: true iff any file in `files` is tagged kTiered. Every
+// read/compaction-input path below that assumes a level is sorted and
+// disjoint (binary search, a single monotonic per-level pointer, or a
+// concatenating iterator) is only safe when this is false; each such
+// site branches on this exact helper -- fast path unchanged when false,
+// a full linear/overlap-safe path when true -- so the "is this level
+// still non-overlapping?" check is one auditable function, not five
+// slightly-different inline reimplementations.
+static bool ContainsTiered(const std::vector<FileMetaData*>& files) {
+  for (size_t i = 0; i < files.size(); i++) {
+    if (files[i]->strategy == kTiered) return true;
+  }
+  return false;
+}
+
+static int64_t CountTiered(const std::vector<FileMetaData*>& files) {
+  int64_t count = 0;
+  for (size_t i = 0; i < files.size(); i++) {
+    if (files[i]->strategy == kTiered) count++;
+  }
+  return count;
+}
+
+// AMETHYST Phase 3: which levels may accumulate genuinely overlapping
+// kTiered runs (instead of every compaction flattening its output into
+// the destination level immediately). Restricted to level 1 only for the
+// first cut -- not just to shrink the diff, but because
+// Compaction::IsBaseLevelForKey only inspects levels >= level_+2, so
+// level-1-only accumulation makes the tombstone-resurrection path that
+// guard defends against unreachable by construction (a compaction would
+// need level_ <= -1 for level 1 to ever be a grandparent-or-deeper
+// level). That guard becomes load-bearing, not just defense in depth,
+// the moment this function's range is generalized past level 1.
+//
+// Gated on adaptive_enabled here -- the single point every call site
+// goes through -- rather than at each call site separately: every
+// FileMetaData defaults to kTiered (pre-existing, harmless while tiering
+// was cosmetic), so without this gate a stock-baseline DB
+// (adaptive_enabled=false) would still satisfy every other accumulation
+// condition on its level-1 files and silently diverge from stock, which
+// is exactly the property Phase 2's parity check exists to guarantee
+// never happens.
+static bool LevelAllowsTieredAccumulation(const Options* options, int level) {
+  return options->adaptive_enabled && level == 1;
+}
+
 Version::~Version() {
   assert(refs_ == 0);
 
@@ -236,9 +282,18 @@ void Version::AddIterators(const ReadOptions& options,
 
   // For levels > 0, we can use a concatenating iterator that sequentially
   // walks through the non-overlapping files in the level, opening them
-  // lazily.
+  // lazily. AMETHYST: that concatenating iterator assumes the level is
+  // sorted and disjoint -- no longer true for a level holding genuinely
+  // overlapping kTiered runs, so treat such a level like L0 instead (one
+  // iterator per file, correctly merged by the caller's NewMergingIterator).
   for (int level = 1; level < config::kNumLevels; level++) {
-    if (!files_[level].empty()) {
+    if (files_[level].empty()) continue;
+    if (ContainsTiered(files_[level])) {
+      for (size_t i = 0; i < files_[level].size(); i++) {
+        iters->push_back(vset_->table_cache_->NewIterator(
+            options, files_[level][i]->number, files_[level][i]->file_size));
+      }
+    } else {
       iters->push_back(NewConcatenatingIterator(options, level));
     }
   }
@@ -308,16 +363,7 @@ void Version::ForEachOverlapping(Slice user_key, Slice internal_key, void* arg,
     size_t num_files = files_[level].size();
     if (num_files == 0) continue;
 
-    // Check if the level contains any files tagged kTiered
-    bool level_contains_tiered = false;
-    for (size_t i = 0; i < num_files; i++) {
-      if (files_[level][i]->strategy == kTiered) {
-        level_contains_tiered = true;
-        break;
-      }
-    }
-
-    if (level_contains_tiered) {
+    if (ContainsTiered(files_[level])) {
       // Fall back to a linear search (newest to oldest), treating them identically to Level 0 overlapping files.
       std::vector<FileMetaData*> tmp;
       tmp.reserve(num_files);
@@ -545,8 +591,14 @@ void Version::Unref() {
 
 bool Version::OverlapInLevel(int level, const Slice* smallest_user_key,
                              const Slice* largest_user_key) {
-  return SomeFileOverlapsRange(vset_->icmp_, (level > 0), files_[level],
-                               smallest_user_key, largest_user_key);
+  // AMETHYST: disjoint_sorted_files drives SomeFileOverlapsRange's binary
+  // search, which requires level>0 to actually be sorted/disjoint. Once a
+  // level can hold genuinely overlapping kTiered runs that no longer
+  // holds -- fall back to the full linear scan (see ContainsTiered).
+  bool disjoint_sorted_files = (level > 0) && !ContainsTiered(files_[level]);
+  return SomeFileOverlapsRange(vset_->icmp_, disjoint_sorted_files,
+                               files_[level], smallest_user_key,
+                               largest_user_key);
 }
 
 int Version::PickLevelForMemTableOutput(const Slice& smallest_user_key,
@@ -779,8 +831,15 @@ class VersionSet::Builder {
       }
 
 #ifndef NDEBUG
-      // Make sure there is no overlap in levels > 0
-      if (level > 0) {
+      // Make sure there is no overlap in levels > 0, except at the exact
+      // level Phase 3 allows to accumulate kTiered runs. Gated on
+      // LevelAllowsTieredAccumulation (level + adaptive_enabled), NOT on
+      // the kTiered tag alone: every FileMetaData defaults to kTiered,
+      // so relaxing on the tag alone would silently disable this
+      // overlap-corruption detector at every level >= 2 too (and even at
+      // level 1 when adaptive_enabled is false), for zero benefit --
+      // those levels/configurations never legitimately accumulate.
+      if (level > 0 && !LevelAllowsTieredAccumulation(vset_->options_, level)) {
         for (uint32_t i = 1; i < v->files_[level].size(); i++) {
           const InternalKey& prev_end = v->files_[level][i - 1]->largest;
           const InternalKey& this_begin = v->files_[level][i]->smallest;
@@ -801,7 +860,11 @@ class VersionSet::Builder {
       // File is deleted: do nothing
     } else {
       std::vector<FileMetaData*>* files = &v->files_[level];
-      if (level > 0 && !files->empty()) {
+      // AMETHYST Phase 3: same gate as the debug-only scan in SaveTo
+      // above -- see that comment for why this is keyed on
+      // LevelAllowsTieredAccumulation, not the kTiered tag.
+      if (level > 0 && !files->empty() &&
+          !LevelAllowsTieredAccumulation(vset_->options_, level)) {
         // Must not overlap
         assert(vset_->icmp_.Compare((*files)[files->size() - 1]->largest,
                                     f->smallest) < 0);
@@ -1136,6 +1199,23 @@ void VersionSet::Finalize(Version* v) {
       const uint64_t level_bytes = TotalFileSize(v->files_[level]);
       score =
           static_cast<double>(level_bytes) / MaxBytesForLevel(options_, level);
+
+      // AMETHYST Phase 3: a level accumulating overlapping kTiered runs
+      // also becomes eligible for compaction once its run count crosses
+      // the batch-merge threshold, via this same score/best_level slot --
+      // not a separate trigger, so a level can never be selected for both
+      // a normal leveled compaction and a tiered batch-merge at once.
+      // Whichever score is higher wins, exactly like L0's file-count
+      // score and every other level's byte-ratio score already coexist.
+      if (LevelAllowsTieredAccumulation(options_, level)) {
+        const int64_t tiered_runs = CountTiered(v->files_[level]);
+        const double tiered_score =
+            static_cast<double>(tiered_runs) /
+            options_->tiered_batch_merge_run_threshold;
+        if (tiered_score > score) {
+          score = tiered_score;
+        }
+      }
     }
 
     if (score > best_score) {
@@ -1223,6 +1303,41 @@ const FileMetaData* VersionSet::TEST_FindFile(int level, uint64_t file_number) c
     if (f->number == file_number) return f;
   }
   return nullptr;
+}
+
+bool VersionSet::TEST_RunLockedCompaction(int level, uint64_t file_number,
+                                          Strategy explicit_target,
+                                          Strategy* result_strategy,
+                                          bool* inputs1_empty) {
+  FileMetaData* f = nullptr;
+  for (FileMetaData* file : current_->files_[level]) {
+    if (file->number == file_number) {
+      f = file;
+      break;
+    }
+  }
+  if (f == nullptr) return false;
+
+  Compaction c(options_, level);
+  c.inputs_[0].push_back(f);
+  c.target_strategy_ = explicit_target;
+  c.strategy_locked_ = true;
+  c.input_version_ = current_;
+  c.input_version_->Ref();
+
+  SetupOtherInputs(&c);
+
+  *result_strategy = c.target_strategy_;
+  *inputs1_empty = c.inputs_[1].empty();
+  return true;
+}
+
+bool VersionSet::TEST_IsBaseLevelForKey(int compaction_level,
+                                        const Slice& user_key) {
+  Compaction c(options_, compaction_level);
+  c.input_version_ = current_;
+  c.input_version_->Ref();
+  return c.IsBaseLevelForKey(user_key);
 }
 
 uint64_t VersionSet::ApproximateOffsetOf(Version* v, const InternalKey& ikey) {
@@ -1332,15 +1447,29 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   options.verify_checksums = options_->paranoid_checks;
   options.fill_cache = false;
 
-  // Level-0 files have to be merged together.  For other levels,
-  // we will make a concatenating iterator per level.
-  // TODO(opt): use concatenating iterator for level-0 if there is no overlap
-  const int space = (c->level() == 0 ? c->inputs_[0].size() + 1 : 2);
+  // Level-0 files have to be merged together file-by-file since they may
+  // overlap. AMETHYST: so does any input set drawn from a genuinely
+  // overlapping tiered level -- a batch-merge's inputs_[0] is, by
+  // construction, every tiered run at that level, and the concatenating
+  // iterator below silently assumes its inputs are sorted and disjoint.
+  // Feeding it overlapping files would hand DoCompactionWork's merge
+  // loop a stream that isn't actually sorted by internal key, silently
+  // breaking the one invariant its drop logic depends on (duplicate user
+  // keys arriving in descending-sequence order). For any other level, we
+  // make a concatenating iterator per level, as before.
+  int space = 0;
+  for (int which = 0; which < 2; which++) {
+    if (c->level() + which == 0 || ContainsTiered(c->inputs_[which])) {
+      space += static_cast<int>(c->inputs_[which].size());
+    } else {
+      space += 1;
+    }
+  }
   Iterator** list = new Iterator*[space];
   int num = 0;
   for (int which = 0; which < 2; which++) {
     if (!c->inputs_[which].empty()) {
-      if (c->level() + which == 0) {
+      if (c->level() + which == 0 || ContainsTiered(c->inputs_[which])) {
         const std::vector<FileMetaData*>& files = c->inputs_[which];
         for (size_t i = 0; i < files.size(); i++) {
           list[num++] = table_cache_->NewIterator(options, files[i]->number,
@@ -1417,18 +1546,37 @@ Compaction* VersionSet::PickCompaction() {
     assert(level + 1 < config::kNumLevels);
     c = new Compaction(options_, level);
 
-    // Pick the first file that comes after compact_pointer_[level]
-    for (size_t i = 0; i < current_->files_[level].size(); i++) {
-      FileMetaData* f = current_->files_[level][i];
-      if (compact_pointer_[level].empty() ||
-          icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
-        c->inputs_[0].push_back(f);
-        break;
+    // AMETHYST Phase 3: if this level's tiered run count is at or over
+    // the batch-merge threshold, gather ALL of its tiered runs as the
+    // input batch -- a deliberate flatten-down of everything that's
+    // accumulated -- instead of the single seed file an ordinary
+    // size-triggered compaction picks below. This shares the same
+    // best_level/best_score selection as any other compaction (see
+    // Finalize), so it can't be picked at the same time as, or conflict
+    // with, a normal leveled compaction of this level.
+    if (LevelAllowsTieredAccumulation(options_, level) &&
+        CountTiered(current_->files_[level]) >=
+            options_->tiered_batch_merge_run_threshold) {
+      for (size_t i = 0; i < current_->files_[level].size(); i++) {
+        FileMetaData* f = current_->files_[level][i];
+        if (f->strategy == kTiered) {
+          c->inputs_[0].push_back(f);
+        }
       }
-    }
-    if (c->inputs_[0].empty()) {
-      // Wrap-around to the beginning of the key space
-      c->inputs_[0].push_back(current_->files_[level][0]);
+    } else {
+      // Pick the first file that comes after compact_pointer_[level]
+      for (size_t i = 0; i < current_->files_[level].size(); i++) {
+        FileMetaData* f = current_->files_[level][i];
+        if (compact_pointer_[level].empty() ||
+            icmp_.Compare(f->largest.Encode(), compact_pointer_[level]) > 0) {
+          c->inputs_[0].push_back(f);
+          break;
+        }
+      }
+      if (c->inputs_[0].empty()) {
+        // Wrap-around to the beginning of the key space
+        c->inputs_[0].push_back(current_->files_[level][0]);
+      }
     }
   } else if (seek_compaction) {
     level = current_->file_to_compact_level_;
@@ -1543,16 +1691,63 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
   GetRange(c->inputs_[0], &smallest, &largest);
 
-  current_->GetOverlappingInputs(level + 1, &smallest, &largest,
-                                 &c->inputs_[1]);
-  AddBoundaryInputs(icmp_, current_->files_[level + 1], &c->inputs_[1]);
+  // Ordinary compactions (size-triggered, seek-triggered, manual
+  // CompactRange) must not silently reset a file's strategy tag back to
+  // the Compaction default (kTiered). Instead they inherit it from the
+  // primary input (inputs_[0], the files at the shallower "level"). Only
+  // the adaptive-controller strategy-switch compaction (PickCompaction)
+  // deliberately assigns a *new* target_strategy_, and it marks
+  // strategy_locked_ so it is left alone here.
+  //
+  // AMETHYST Phase 3: moved up from the end of this function (where
+  // Phase 1 originally computed it) to before the accumulate-vs-merge
+  // decision below, which now depends on it. strategy_locked_ is set by
+  // the caller (PickCompaction's adaptive-rewrite branch) before this
+  // function ever runs, so this reorder doesn't change whether it fires
+  // -- only where in this function the (unchanged) inheritance happens.
+  // One consequence of the reorder: this now always reflects the
+  // originally-picked seed file (inputs_[0][0] as of AddBoundaryInputs),
+  // not whichever file the "expanded0" growth below might reposition to
+  // index 0 -- a more predictable choice than before, though the
+  // underlying KNOWN WART is unchanged: inputs_[0] can hold more than one
+  // file with different strategy tags, and we still take one file as
+  // representative rather than reconciling a per-file strategy across a
+  // multi-file primary input.
+  if (!c->strategy_locked_) {
+    c->target_strategy_ = c->inputs_[0][0]->strategy;
+  }
+
+  // AMETHYST Phase 3: if this compaction's output is tiered and its
+  // destination level is currently allowed to accumulate (see
+  // LevelAllowsTieredAccumulation) and hasn't hit the batch-merge
+  // threshold yet, skip pulling the destination level's existing files
+  // in at all -- the output becomes a new standalone run there instead
+  // of being flattened into whatever's already present. This is the
+  // only place accumulation is decided; every other case (leveled
+  // output, or a destination not currently accumulating -- including
+  // the batch-merge compaction's own output, which flattens normally)
+  // falls through to the unmodified normal path below.
+  const bool accumulate =
+      c->target_strategy_ == kTiered &&
+      LevelAllowsTieredAccumulation(options_, level + 1) &&
+      CountTiered(current_->files_[level + 1]) <
+          options_->tiered_batch_merge_run_threshold;
+  c->accumulated_ = accumulate;
+
+  if (!accumulate) {
+    current_->GetOverlappingInputs(level + 1, &smallest, &largest,
+                                   &c->inputs_[1]);
+    AddBoundaryInputs(icmp_, current_->files_[level + 1], &c->inputs_[1]);
+  }
 
   // Get entire range covered by compaction
   InternalKey all_start, all_limit;
   GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);
 
   // See if we can grow the number of inputs in "level" without
-  // changing the number of "level+1" files we pick up.
+  // changing the number of "level+1" files we pick up. Naturally
+  // skipped when accumulating, since it's gated on inputs_[1] being
+  // non-empty, which it deliberately isn't in that case.
   if (!c->inputs_[1].empty()) {
     std::vector<FileMetaData*> expanded0;
     current_->GetOverlappingInputs(level, &all_start, &all_limit, &expanded0);
@@ -1582,23 +1777,6 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
         GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);
       }
     }
-  }
-
-  // Ordinary compactions (size-triggered, seek-triggered, manual
-  // CompactRange) must not silently reset a file's strategy tag back to
-  // the Compaction default (kTiered). Instead they inherit it from the
-  // primary input (inputs_[0], the files at the shallower "level"). Only
-  // the adaptive-controller strategy-switch compaction (PickCompaction)
-  // deliberately assigns a *new* target_strategy_, and it marks
-  // strategy_locked_ so it is left alone here.
-  //
-  // KNOWN WART: inputs_[0] can hold more than one file (L0 overlap
-  // expansion, or the expanded0 growth above), and those files could in
-  // principle carry different strategy tags. We take the first file as
-  // representative rather than trying to reconcile a per-file strategy
-  // across a multi-file primary input.
-  if (!c->strategy_locked_) {
-    c->target_strategy_ = c->inputs_[0][0]->strategy;
   }
 
   // Compute the set of grandparent files that overlap this compaction
@@ -1657,7 +1835,8 @@ Compaction::Compaction(const Options* options, int level)
       seen_key_(false),
       overlapped_bytes_(0),
       target_strategy_(kTiered),
-      strategy_locked_(false) {
+      strategy_locked_(false),
+      accumulated_(false) {
   for (int i = 0; i < config::kNumLevels; i++) {
     level_ptrs_[i] = 0;
   }
@@ -1690,8 +1869,48 @@ void Compaction::AddInputDeletions(VersionEdit* edit) {
 bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
   // Maybe use binary search to find right entry instead of linear search?
   const Comparator* user_cmp = input_version_->vset_->icmp_.user_comparator();
-  for (int lvl = level_ + 2; lvl < config::kNumLevels; lvl++) {
+
+  // AMETHYST Phase 3: normally starts at level_+2, because level_+1's
+  // overlapping files are assumed to already be part of inputs_[1] and
+  // thus reconciled by this compaction's own merge pass -- checking them
+  // again here would be redundant. accumulated_ breaks that assumption:
+  // SetupOtherInputs deliberately left inputs_[1] empty so this
+  // compaction's output becomes a new standalone run at level_+1 instead
+  // of merging with what's already there, so an existing sibling run at
+  // level_+1 was never looked at by this pass at all. Without starting
+  // the check at level_+1 in that case, a tombstone from one
+  // accumulate-mode compaction could be dropped as "no deeper copy
+  // exists" while an older live value for the same key still sits in
+  // that untouched sibling run -- silently resurrecting it. (Verified:
+  // this is exactly the DBTest.Randomized failure this fix resolves.)
+  const int start_level = accumulated_ ? level_ + 1 : level_ + 2;
+  for (int lvl = start_level; lvl < config::kNumLevels; lvl++) {
     const std::vector<FileMetaData*>& files = input_version_->files_[lvl];
+
+    // The level_ptrs_ monotonic-advance loop below requires `files` to
+    // be sorted and disjoint -- once we advance past a file we never
+    // look at it again for a later (larger) user_key, which is only
+    // sound if no later key could still fall in an earlier file's
+    // range. That breaks if this level holds genuinely overlapping
+    // kTiered runs: dropping a tombstone based on a false "not present
+    // deeper" answer here would resurrect a still-live older value. At
+    // level_+2 and deeper this remains unreachable at Phase 3's
+    // level-1-only accumulation scope (defense in depth, becomes
+    // load-bearing if accumulation generalizes past level 1) -- but at
+    // level_+1 specifically, when accumulated_ is true, this level IS
+    // level 1 and DOES genuinely need the overlap-safe path, since
+    // that's exactly the level this compaction chose not to merge with.
+    if (ContainsTiered(files)) {
+      for (size_t i = 0; i < files.size(); i++) {
+        FileMetaData* f = files[i];
+        if (user_cmp->Compare(user_key, f->smallest.user_key()) >= 0 &&
+            user_cmp->Compare(user_key, f->largest.user_key()) <= 0) {
+          return false;
+        }
+      }
+      continue;
+    }
+
     while (level_ptrs_[lvl] < files.size()) {
       FileMetaData* f = files[level_ptrs_[lvl]];
       if (user_cmp->Compare(user_key, f->largest.user_key()) <= 0) {

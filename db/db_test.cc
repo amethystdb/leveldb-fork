@@ -298,6 +298,13 @@ class DBTest : public testing::Test {
     Reopen();
   }
 
+  // AMETHYST: set before the first Reopen/DestroyAndReopen of a test to
+  // force adaptive_enabled=true regardless of option_config_ -- used by
+  // RandomizedWithAdaptiveEnabled below. Defaults to false so every
+  // other test's CurrentOptions() is unaffected (adaptive_enabled itself
+  // defaults to false; see Options).
+  bool force_adaptive_enabled_ = false;
+
   ~DBTest() {
     delete db_;
     DestroyDB(dbname_, Options());
@@ -321,6 +328,9 @@ class DBTest : public testing::Test {
   Options CurrentOptions() {
     Options options;
     options.reuse_logs = false;
+    if (force_adaptive_enabled_) {
+      options.adaptive_enabled = true;
+    }
     switch (option_config_) {
       case kReuse:
         options.reuse_logs = true;
@@ -584,6 +594,13 @@ class DBTest : public testing::Test {
     }
     return files_renamed;
   }
+
+  // Shared body of DBTest.Randomized: model-vs-real-DB fuzzing with
+  // forward/reverse iterator comparisons, periodic reopen. Factored out
+  // so RandomizedWithAdaptiveEnabled below can run the exact same stress
+  // test with force_adaptive_enabled_ set, instead of duplicating it.
+  // Defined out-of-line, after ModelDB/CompareIterators, which it needs.
+  void RunRandomizedIteration(Random* rnd);
 
  private:
   // Sequence of option configurations to try
@@ -2314,72 +2331,100 @@ static bool CompareIterators(int step, DB* model, DB* db,
   return ok;
 }
 
+void DBTest::RunRandomizedIteration(Random* rnd) {
+  ModelDB model(CurrentOptions());
+  const int N = 10000;
+  const Snapshot* model_snap = nullptr;
+  const Snapshot* db_snap = nullptr;
+  std::string k, v;
+  for (int step = 0; step < N; step++) {
+    if (step % 100 == 0) {
+      std::fprintf(stderr, "Step %d of %d\n", step, N);
+    }
+    // TODO(sanjay): Test Get() works
+    int p = rnd->Uniform(100);
+    if (p < 45) {  // Put
+      k = RandomKey(rnd);
+      v = RandomString(
+          rnd, rnd->OneIn(20) ? 100 + rnd->Uniform(100) : rnd->Uniform(8));
+      ASSERT_LEVELDB_OK(model.Put(WriteOptions(), k, v));
+      ASSERT_LEVELDB_OK(db_->Put(WriteOptions(), k, v));
+
+    } else if (p < 90) {  // Delete
+      k = RandomKey(rnd);
+      ASSERT_LEVELDB_OK(model.Delete(WriteOptions(), k));
+      ASSERT_LEVELDB_OK(db_->Delete(WriteOptions(), k));
+
+    } else {  // Multi-element batch
+      WriteBatch b;
+      const int num = rnd->Uniform(8);
+      for (int i = 0; i < num; i++) {
+        if (i == 0 || !rnd->OneIn(10)) {
+          k = RandomKey(rnd);
+        } else {
+          // Periodically re-use the same key from the previous iter, so
+          // we have multiple entries in the write batch for the same key
+        }
+        if (rnd->OneIn(2)) {
+          v = RandomString(rnd, rnd->Uniform(10));
+          b.Put(k, v);
+        } else {
+          b.Delete(k);
+        }
+      }
+      ASSERT_LEVELDB_OK(model.Write(WriteOptions(), &b));
+      ASSERT_LEVELDB_OK(db_->Write(WriteOptions(), &b));
+    }
+
+    if ((step % 100) == 0) {
+      ASSERT_TRUE(CompareIterators(step, &model, db_, nullptr, nullptr));
+      ASSERT_TRUE(CompareIterators(step, &model, db_, model_snap, db_snap));
+      // Save a snapshot from each DB this time that we'll use next
+      // time we compare things, to make sure the current state is
+      // preserved with the snapshot
+      if (model_snap != nullptr) model.ReleaseSnapshot(model_snap);
+      if (db_snap != nullptr) db_->ReleaseSnapshot(db_snap);
+
+      Reopen();
+      ASSERT_TRUE(CompareIterators(step, &model, db_, nullptr, nullptr));
+
+      model_snap = model.GetSnapshot();
+      db_snap = db_->GetSnapshot();
+    }
+  }
+  if (model_snap != nullptr) model.ReleaseSnapshot(model_snap);
+  if (db_snap != nullptr) db_->ReleaseSnapshot(db_snap);
+}
+
 TEST_F(DBTest, Randomized) {
   Random rnd(test::RandomSeed());
   do {
-    ModelDB model(CurrentOptions());
-    const int N = 10000;
-    const Snapshot* model_snap = nullptr;
-    const Snapshot* db_snap = nullptr;
-    std::string k, v;
-    for (int step = 0; step < N; step++) {
-      if (step % 100 == 0) {
-        std::fprintf(stderr, "Step %d of %d\n", step, N);
-      }
-      // TODO(sanjay): Test Get() works
-      int p = rnd.Uniform(100);
-      if (p < 45) {  // Put
-        k = RandomKey(&rnd);
-        v = RandomString(
-            &rnd, rnd.OneIn(20) ? 100 + rnd.Uniform(100) : rnd.Uniform(8));
-        ASSERT_LEVELDB_OK(model.Put(WriteOptions(), k, v));
-        ASSERT_LEVELDB_OK(db_->Put(WriteOptions(), k, v));
-
-      } else if (p < 90) {  // Delete
-        k = RandomKey(&rnd);
-        ASSERT_LEVELDB_OK(model.Delete(WriteOptions(), k));
-        ASSERT_LEVELDB_OK(db_->Delete(WriteOptions(), k));
-
-      } else {  // Multi-element batch
-        WriteBatch b;
-        const int num = rnd.Uniform(8);
-        for (int i = 0; i < num; i++) {
-          if (i == 0 || !rnd.OneIn(10)) {
-            k = RandomKey(&rnd);
-          } else {
-            // Periodically re-use the same key from the previous iter, so
-            // we have multiple entries in the write batch for the same key
-          }
-          if (rnd.OneIn(2)) {
-            v = RandomString(&rnd, rnd.Uniform(10));
-            b.Put(k, v);
-          } else {
-            b.Delete(k);
-          }
-        }
-        ASSERT_LEVELDB_OK(model.Write(WriteOptions(), &b));
-        ASSERT_LEVELDB_OK(db_->Write(WriteOptions(), &b));
-      }
-
-      if ((step % 100) == 0) {
-        ASSERT_TRUE(CompareIterators(step, &model, db_, nullptr, nullptr));
-        ASSERT_TRUE(CompareIterators(step, &model, db_, model_snap, db_snap));
-        // Save a snapshot from each DB this time that we'll use next
-        // time we compare things, to make sure the current state is
-        // preserved with the snapshot
-        if (model_snap != nullptr) model.ReleaseSnapshot(model_snap);
-        if (db_snap != nullptr) db_->ReleaseSnapshot(db_snap);
-
-        Reopen();
-        ASSERT_TRUE(CompareIterators(step, &model, db_, nullptr, nullptr));
-
-        model_snap = model.GetSnapshot();
-        db_snap = db_->GetSnapshot();
-      }
-    }
-    if (model_snap != nullptr) model.ReleaseSnapshot(model_snap);
-    if (db_snap != nullptr) db_->ReleaseSnapshot(db_snap);
+    RunRandomizedIteration(&rnd);
   } while (ChangeOptions());
+}
+
+TEST_F(DBTest, RandomizedWithAdaptiveEnabled) {
+  // AMETHYST Phase 3: the same model-vs-real-DB fuzz/iterator stress
+  // test as Randomized above, but with adaptive_enabled forced true
+  // (genuine tiered overlap active), kept as a permanent regression test
+  // because it caught a real bug during Phase 3 development that
+  // diff_fuzz's workload parameters didn't happen to trigger:
+  // Compaction::IsBaseLevelForKey skipped level_+1, on the assumption
+  // that SetupOtherInputs always merges level_+1's overlapping files
+  // into the compaction (so any duplicate there gets reconciled by the
+  // ordinary same-pass drop logic) -- accumulate-mode compactions
+  // deliberately leave inputs_[1] empty instead, breaking that
+  // assumption. Sequence: Put "k" (accumulates as run A), later Delete
+  // "k" via a *separate* accumulate-mode compaction (run B) -- since
+  // IsBaseLevelForKey never looked at level_+1, it wrongly concluded "no
+  // deeper copy" and dropped the tombstone, silently resurrecting run
+  // A's stale value. Fixed via Compaction::accumulated_ (set whenever
+  // SetupOtherInputs chose to accumulate) plus IsBaseLevelForKey
+  // starting its scan at level_+1 instead of level_+2 in that case.
+  force_adaptive_enabled_ = true;
+  DestroyAndReopen();
+  Random rnd(test::RandomSeed());
+  RunRandomizedIteration(&rnd);
 }
 
 // --- Amethyst Phase 1 correctness tests ---
@@ -2468,6 +2513,62 @@ TEST_F(DBTest, StrategySurvivesOrdinaryCompactionAndReopen) {
   }
 }
 
+TEST_F(DBTest, StrategyLockedSurvivesSetupOtherInputsReordering) {
+  // AMETHYST Phase 3 moved target_strategy_'s inheritance computation
+  // earlier in SetupOtherInputs (needed for the new accumulate-vs-merge
+  // decision, which depends on it). strategy_locked_ is set by the
+  // caller (PickCompaction's adaptive-rewrite branch) before
+  // SetupOtherInputs ever runs, so the reorder shouldn't change whether
+  // it fires -- this locks that in directly against SetupOtherInputs,
+  // without needing to wait out AdaptiveController's real EMA/debounce
+  // timing to reach the adaptive-rewrite branch through PickCompaction
+  // itself.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.write_buffer_size = 100000;
+  DestroyAndReopen(&options);
+
+  Random rnd(707);
+  for (int i = 0; i < 200; i++) {
+    ASSERT_LEVELDB_OK(Put(Key(i), RandomString(&rnd, 200)));
+  }
+  ASSERT_LEVELDB_OK(dbfull()->TEST_CompactMemTable());
+
+  int source_level = -1;
+  for (int level = 0; level < config::kNumLevels - 1; level++) {
+    if (NumTableFilesAtLevel(level) > 0) {
+      source_level = level;
+      break;
+    }
+  }
+  ASSERT_GE(source_level, 0) << "flushed file not found at any level";
+
+  std::vector<uint64_t> source_files =
+      dbfull()->TEST_FileNumbersAtLevel(source_level);
+  ASSERT_EQ(1u, source_files.size());
+  uint64_t target_file = source_files[0];
+
+  // Locked to kLeveled: the accumulate-vs-merge branch requires
+  // target_strategy_ == kTiered, so this should both (a) come back as
+  // kLeveled, not silently reinherited from the file's own tag, and
+  // (b) take the normal (non-accumulating) merge path.
+  Strategy result_strategy = kTiered;
+  bool inputs1_empty = true;
+  ASSERT_TRUE(dbfull()->TEST_RunLockedCompaction(
+      source_level, target_file, kLeveled, &result_strategy, &inputs1_empty));
+  EXPECT_EQ(kLeveled, result_strategy)
+      << "strategy_locked_ did not survive SetupOtherInputs's reordering";
+
+  // Locked to kTiered: same guard, opposite value, to confirm the
+  // protection isn't accidentally specific to one strategy value.
+  result_strategy = kLeveled;
+  inputs1_empty = true;
+  ASSERT_TRUE(dbfull()->TEST_RunLockedCompaction(
+      source_level, target_file, kTiered, &result_strategy, &inputs1_empty));
+  EXPECT_EQ(kTiered, result_strategy)
+      << "strategy_locked_ did not survive SetupOtherInputs's reordering";
+}
+
 TEST_F(DBTest, TieredOverlapResolvesByNewestSequenceNotFileNumber) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
@@ -2532,6 +2633,75 @@ TEST_F(DBTest, TieredOverlapResolvesByNewestSequenceNotFileNumber) {
       << "Get returned the stale (lower-sequence) value instead of "
          "resolving overlapping tiered candidates by actual sequence "
          "number.";
+}
+
+TEST_F(DBTest, IsBaseLevelForKeyDetectsOverlappingDeeperTieredLevel) {
+  // Regression test for the tombstone-resurrection risk flagged in the
+  // Phase 3 design: Compaction::IsBaseLevelForKey used a monotonic
+  // per-level pointer to check levels >= level_+2 for a deeper copy of a
+  // key before allowing a compaction to drop an obsolete tombstone. That
+  // guard now falls back to a full overlap-safe scan whenever a level
+  // contains a kTiered file (see ContainsTiered in version_set.cc).
+  //
+  // At Phase 3's level-1-only accumulation scope this state (overlapping
+  // tiered runs at level 3, a grandparent-or-deeper level relative to a
+  // level-1 compaction) is unreachable through real compaction -- so it
+  // has to be constructed directly via TEST_ hooks, the same way
+  // TieredOverlapResolvesByNewestSequenceNotFileNumber above constructs
+  // overlap that real compaction couldn't produce yet either.
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  DestroyAndReopen(&options);
+
+  InternalKeyComparator icmp(options.comparator);
+  Options table_options = options;
+  table_options.comparator = &icmp;
+
+  const std::string live_key = "resurrect_me";
+  InternalKey ikey_live(live_key, /*seq=*/5, kTypeValue);
+  InternalKey ikey_other(std::string("zzz_other"), /*seq=*/3, kTypeValue);
+
+  // Two files at level 3 with overlapping ranges (both span from
+  // "resurrect_me" through "zzz_other"), tagged kTiered -- exactly the
+  // accumulated-runs state a deeper level could end up in once
+  // accumulation generalizes past level 1.
+  uint64_t file_a_number = dbfull()->TEST_NewFileNumber();
+  ASSERT_LEVELDB_OK(BuildOneEntryTable(env_, table_options,
+                                       TableFileName(dbname_, file_a_number),
+                                       ikey_live, "still_live_value"));
+  uint64_t file_b_number = dbfull()->TEST_NewFileNumber();
+  ASSERT_LEVELDB_OK(BuildOneEntryTable(env_, table_options,
+                                       TableFileName(dbname_, file_b_number),
+                                       ikey_other, "unrelated_value"));
+
+  uint64_t file_a_size = 0, file_b_size = 0;
+  ASSERT_LEVELDB_OK(
+      env_->GetFileSize(TableFileName(dbname_, file_a_number), &file_a_size));
+  ASSERT_LEVELDB_OK(
+      env_->GetFileSize(TableFileName(dbname_, file_b_number), &file_b_size));
+
+  // File A's range covers both keys (so it genuinely overlaps file B),
+  // file B covers only its own key -- both tagged kTiered.
+  InternalKey file_a_smallest(live_key, 5, kTypeValue);
+  InternalKey file_a_largest(std::string("zzz_other"), 5, kTypeValue);
+  ASSERT_LEVELDB_OK(dbfull()->TEST_AddFile(3, file_a_number, file_a_size,
+                                           file_a_smallest, file_a_largest,
+                                           kTiered));
+  ASSERT_LEVELDB_OK(dbfull()->TEST_AddFile(3, file_b_number, file_b_size,
+                                           ikey_other, ikey_other, kTiered));
+
+  // A compaction at level 1 checks levels >= 3 for a deeper copy.
+  EXPECT_FALSE(dbfull()->TEST_IsBaseLevelForKey(1, live_key))
+      << "IsBaseLevelForKey said level 1 is the base level for a key that "
+         "genuinely exists in an overlapping tiered file at level 3 -- "
+         "dropping a tombstone for this key would resurrect it.";
+  // Lexicographically before "resurrect_me", so outside both files'
+  // [smallest,largest] ranges entirely (not just absent as an entry --
+  // IsBaseLevelForKey only ever checks range boundaries, the same
+  // conservative approximation stock LevelDB always used).
+  EXPECT_TRUE(dbfull()->TEST_IsBaseLevelForKey(1, "aaa_before_range"))
+      << "IsBaseLevelForKey found a deeper copy for a key outside every "
+         "level-3 file's range.";
 }
 
 }  // namespace leveldb
