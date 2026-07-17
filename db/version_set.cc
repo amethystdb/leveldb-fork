@@ -1197,6 +1197,20 @@ const char* VersionSet::LevelSummary(LevelSummaryStorage* scratch) const {
   return scratch->buffer;
 }
 
+void VersionSet::StrategyCounts(int64_t* tiered, int64_t* leveled) const {
+  *tiered = 0;
+  *leveled = 0;
+  for (int level = 0; level < config::kNumLevels; level++) {
+    for (FileMetaData* f : current_->files_[level]) {
+      if (f->strategy == kTiered) {
+        ++*tiered;
+      } else {
+        ++*leveled;
+      }
+    }
+  }
+}
+
 void VersionSet::TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const {
   numbers->clear();
   for (FileMetaData* f : current_->files_[level]) {
@@ -1350,38 +1364,45 @@ Compaction* VersionSet::PickCompaction() {
   Compaction* c;
   int level;
 
-  // Cleanup history map in adaptive controller to prevent memory growth
-  {
-    std::set<uint64_t> active_files;
-    for (int l = 0; l < config::kNumLevels; l++) {
-      for (FileMetaData* file : current_->files_[l]) {
-        active_files.insert(file->number);
-      }
-    }
-    adaptive_controller_.Cleanup(active_files);
-  }
-
-  // Iterate over current files and check if any should switch strategy
-  for (int lvl = 0; lvl < config::kNumLevels - 1; lvl++) {
-    for (size_t i = 0; i < current_->files_[lvl].size(); i++) {
-      FileMetaData* f = current_->files_[lvl][i];
-      Strategy target_strategy = f->strategy;
-      if (adaptive_controller_.ShouldRewrite(f, &target_strategy)) {
-        level = lvl;
-        c = new Compaction(options_, level);
-        c->inputs_[0].push_back(f);
-        c->target_strategy_ = target_strategy;
-        c->strategy_locked_ = true;
-        c->input_version_ = current_;
-        c->input_version_->Ref();
-
-        if (level == 0) {
-          InternalKey smallest, largest;
-          GetRange(c->inputs_[0], &smallest, &largest);
-          current_->GetOverlappingInputs(0, &smallest, &largest, &c->inputs_[0]);
+  // AMETHYST: skipped entirely when adaptive_enabled is false, so
+  // stock-baseline compaction scheduling is byte-identical to stock
+  // LevelDB's PickCompaction (no adaptive_controller_ consultation, no
+  // rewrite compactions preempting the normal size/seek logic below).
+  if (options_->adaptive_enabled) {
+    // Cleanup history map in adaptive controller to prevent memory growth
+    {
+      std::set<uint64_t> active_files;
+      for (int l = 0; l < config::kNumLevels; l++) {
+        for (FileMetaData* file : current_->files_[l]) {
+          active_files.insert(file->number);
         }
-        SetupOtherInputs(c);
-        return c;
+      }
+      adaptive_controller_.Cleanup(active_files);
+    }
+
+    // Iterate over current files and check if any should switch strategy
+    for (int lvl = 0; lvl < config::kNumLevels - 1; lvl++) {
+      for (size_t i = 0; i < current_->files_[lvl].size(); i++) {
+        FileMetaData* f = current_->files_[lvl][i];
+        Strategy target_strategy = f->strategy;
+        if (adaptive_controller_.ShouldRewrite(f, &target_strategy)) {
+          level = lvl;
+          c = new Compaction(options_, level);
+          c->inputs_[0].push_back(f);
+          c->target_strategy_ = target_strategy;
+          c->strategy_locked_ = true;
+          c->input_version_ = current_;
+          c->input_version_->Ref();
+
+          if (level == 0) {
+            InternalKey smallest, largest;
+            GetRange(c->inputs_[0], &smallest, &largest);
+            current_->GetOverlappingInputs(0, &smallest, &largest,
+                                           &c->inputs_[0]);
+          }
+          SetupOtherInputs(c);
+          return c;
+        }
       }
     }
   }

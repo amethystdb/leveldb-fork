@@ -270,6 +270,12 @@ class VersionSet {
   };
   const char* LevelSummary(LevelSummaryStorage* scratch) const;
 
+  // AMETHYST: count files currently tagged kTiered vs kLeveled across all
+  // levels of the current version. Used for reporting on adaptive
+  // promotion/demotion activity (e.g. via the "leveldb.strategy-counts"
+  // property), independent of testing.
+  void StrategyCounts(int64_t* tiered, int64_t* leveled) const;
+
   // Test-only: file numbers currently present at the given level, in
   // Version order.
   void TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const;

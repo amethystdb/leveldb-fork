@@ -1586,6 +1586,29 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
   } else if (in == "sstables") {
     *value = versions_->current()->DebugString();
     return true;
+  } else if (in == "bytes-written") {
+    // AMETHYST: sum of stats_[level].bytes_written across all levels, in
+    // raw bytes (not the MB-rounded "stats" property), for write
+    // amplification: this includes both memtable->L0 flush output
+    // (WriteLevel0Table) and compaction output (DoCompactionWork).
+    int64_t total = 0;
+    for (int level = 0; level < config::kNumLevels; level++) {
+      total += stats_[level].bytes_written;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(total));
+    *value = buf;
+    return true;
+  } else if (in == "strategy-counts") {
+    // AMETHYST: files currently tagged kTiered vs kLeveled across all
+    // levels, for reporting on adaptive promotion/demotion activity.
+    int64_t tiered = 0, leveled = 0;
+    versions_->StrategyCounts(&tiered, &leveled);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "tiered=%lld leveled=%lld",
+                  static_cast<long long>(tiered), static_cast<long long>(leveled));
+    *value = buf;
+    return true;
   } else if (in == "approximate-memory-usage") {
     size_t total_usage = options_.block_cache->TotalCharge();
     if (mem_) {
@@ -1677,9 +1700,13 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     // AMETHYST: started only on the success path, so a failed Open (which
     // falls through to `delete impl` below without ever reaching this
     // line) leaves periodic_poll_thread_ in its default not-a-thread
-    // state, making ~DBImpl's joinable() guard a safe no-op.
-    impl->periodic_poll_thread_ =
-        std::thread(&DBImpl::PeriodicAdaptiveCheckLoop, impl);
+    // state, making ~DBImpl's joinable() guard a safe no-op. Gated on
+    // adaptive_enabled: with it false, no thread is spawned at all, so a
+    // stock-baseline DB has zero Amethyst-introduced scheduling activity.
+    if (impl->options_.adaptive_enabled) {
+      impl->periodic_poll_thread_ =
+          std::thread(&DBImpl::PeriodicAdaptiveCheckLoop, impl);
+    }
     *dbptr = impl;
   } else {
     delete impl;

@@ -151,8 +151,15 @@ struct LEVELDB_EXPORT Options {
   // strategy should switch (AdaptiveController::ShouldRewrite), so that
   // read-heavy phases with no write pressure can still trigger a
   // promotion. This is a research/adaptation-cadence knob, not a stock
-  // LevelDB option.
+  // LevelDB option. Only takes effect when adaptive_enabled is true.
   int adaptive_poll_interval_ms = 2500;
+
+  // AMETHYST: master switch for the adaptive engine. When false, no
+  // periodic poll thread is spawned and PickCompaction's adaptive-rewrite
+  // check is skipped entirely, so the engine's compaction scheduling is
+  // that of stock LevelDB -- this is the stock-baseline mode used for
+  // apples-to-apples benchmark comparisons within this fork.
+  bool adaptive_enabled = true;
 };
 
 // Options that control read operations
