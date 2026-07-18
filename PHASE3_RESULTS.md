@@ -75,6 +75,18 @@ non-reproducibility is itself a finding.
 WA/SA for readrandom, overwrite, and shifting include their populate/setup
 phase, per the workload driver's own instrumentation.
 
+The "shifting (write phases)" row's WA/RA/SA/transitions dashes are a
+measurement-scope choice in `RunShifting` (`amethyst_bench.cc`), not a gap:
+that function computes WA/RA/SA once, from the whole run (after all 3
+read/write cycles plus a final settle), not split per phase — those values
+are the ones shown on the "read phases" row above. Only throughput is
+captured twice: `r.throughput` is the aggregate read-phase throughput (the
+first-class `Result` field), and a separate write-phase throughput is timed
+around each cycle's `WritePhase` call and appended as a formatted string into
+`r.notes` rather than being a second `Result` field — hence the two-row split
+in this table is a display choice on top of one `RunShifting()` call's
+output, not two independent benchmark runs.
+
 ## What these numbers actually show
 
 - **Zero transitions everywhere, again.** As in Phase 2, no run of any
@@ -92,40 +104,58 @@ phase, per the workload driver's own instrumentation.
   likely. The WA/SA differences that *do* show up below come entirely from
   Phase 3's accumulate/batch-merge mechanism itself (which runs independently
   of `ShouldRewrite`), not from any strategy switch.
-- **overwrite: SA is measurably higher under adaptive (4.821 vs 4.555), WA
-  slightly higher too (1.171 vs 1.141).** This is the expected Phase 3 cost
-  of real tiering flagged above: L1 holds accumulated overlapping runs
-  (`tiered=4` vs stock's `tiered=3` at settle) before batch-merging, so more
-  live data is held at once. Small keyspace (3,000 keys) keeps this modest in
-  absolute terms, but the direction is exactly the predicted trade — this is
-  not a bug.
+- **Count-triggered accumulation breaks LSM compaction's usual confluence
+  property.** Ordinary stock LevelDB compaction is confluent — the same
+  fixed-seed `Put` sequence always converges to the same final sorted state
+  regardless of background-thread scheduling order. This fork's
+  `tiered_batch_merge_run_threshold` mechanism does not have that property:
+  whether a given L0→L1 flush becomes "the Nth accumulated run" (triggering
+  an immediate batch-merge to the next level) or stays below threshold
+  depends on the real-time interleaving of the background compaction thread
+  against the foreground write loop — genuine OS-scheduling nondeterminism,
+  not a function of the logical operation sequence. This is a **structural
+  property of run-count-triggered tiering, not a bug specific to this
+  implementation**, and it's the direct cause of fillrandom/adaptive's WA/SA
+  instability below: large keyspaces with many threshold-crossing
+  opportunities expose it, small keyspaces with only 1-2 accumulation cycles
+  (`overwrite`, `shifting`) don't.
+- **overwrite: SA is measurably higher under adaptive (4.821 vs 4.555,
+  stable across 5 repeats).** This is the expected Phase 3 cost of real
+  tiering flagged above: L1 holds accumulated overlapping runs (`tiered=4`
+  vs stock's `tiered=3` at settle) before batch-merging, so more live data is
+  held at once. Small keyspace (3,000 keys) keeps this modest in absolute
+  terms, but the direction is exactly the predicted trade — this is not a
+  bug.
+- **overwrite's WA is also higher under adaptive (1.171 vs 1.141, stable
+  across 5 repeats) — this is NOT the expected direction and is an open
+  question, not a confirmed cost.** Tiering's classic benefit is *lower* WA
+  (amortizing merges over accumulated runs) traded for higher RA/SA, so a WA
+  increase alongside the SA increase is worth flagging rather than folding
+  into "expected tiering cost" the way the SA finding above is. Working
+  hypothesis, not yet verified: when the 4 accumulated L1 runs finally
+  batch-merge, they flatten in one larger event that may pull in more
+  overlapping L2 neighbors per merge than stock's smaller, more frequent
+  L1→L2 compactions would — so bytes-per-merge-event rises even as merge
+  frequency falls, and on this workload's small keyspace (3,000 keys) that
+  effect may outweigh the amortization benefit. Not investigated further in
+  this pass; `transitions=0` rules out the adaptive-switching path as the
+  cause, and the margin is small enough that it doesn't meet the "large
+  win/loss is a bug" bar for immediate investigation — noted as an open
+  question for Track B or later analysis.
 - **fillrandom/adaptive's WA and SA are NOT reproducible across 5 repeats**
   (WA 2.923–3.216, SA 1.013–1.174, tiered-file count 11–13 at settle) —
   investigated rather than averaged. Diagnosis: a scratch-patched build that
   kept re-reading WA for 8s after `SettleCompaction()` returns showed each
   individual run is internally stable (flat for the full 8s) — so this is
   **not** a premature-settle artifact. The final *converged* state itself
-  genuinely differs run to run. Root cause: `tiered_batch_merge_run_threshold`
-  (the only batch-merge trigger in this cut — no size-based trigger) is a
-  **run-count** threshold, and whether a given L0→L1 flush becomes "the 4th
-  accumulated run" (triggering an immediate flatten to L2) or stays "the 3rd"
-  depends on the real-time interleaving of the background compaction thread
-  against the foreground write loop — genuine OS-scheduling nondeterminism,
-  not a function of the logical (fixed-seed) `Put` sequence. Ordinary stock
-  LevelDB compaction is confluent (same final sorted state regardless of
-  scheduling order), so it doesn't have this problem — count-triggered
-  accumulate/batch-merge is not confluent, since crossing the threshold
-  earlier vs. later leads to materially different total compaction work from
-  then on. `overwrite` and `shifting` don't expose this because their small
+  genuinely differs run to run, for the non-confluence reason explained
+  above. `overwrite` and `shifting` don't expose it because their small
   keyspaces (3,000 / 5,000 keys) only ever produce 3–4 tiered files total,
   giving little room to hover near a threshold crossing more than once;
   fillrandom's 100k-keyspace run produces enough L1 files (11–13) to cross
   the threshold multiple times, giving scheduling jitter repeated chances to
-  tip the outcome. **This is a legitimate, mechanistically-understood
-  limitation of the current run-count-only trigger design** (already flagged
-  as the only trigger in this cut), not a workload-tuning artifact — reported
-  as a range per the user's explicit direction, not averaged into a single
-  misleading number.
+  tip the outcome. Reported as a range per the user's explicit direction, not
+  averaged into a single misleading number.
 - **readrandom/stock's RA and SA are also not fully reproducible across 5
   repeats** (RA 1.000–1.071 stable-ish; SA is 1.013 in 4 of 5 runs but 2.078
   in one) — found while investigating the above and worth flagging since it
