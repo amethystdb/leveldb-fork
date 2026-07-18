@@ -3,11 +3,27 @@
 
 namespace leveldb {
 
+namespace {
+// AMETHYST: minimum number of distinct polling samples a file's history
+// must hold before ShouldRewrite will trust the EMA enough to switch
+// strategy. Guards against the EMA cold-start transient -- see the
+// warm-up-guard comment in ShouldRewrite for why this recurs continuously
+// here rather than only once at DB open.
+constexpr size_t kMinWindowsForSwitch = 4;
+}  // namespace
+
 void AdaptiveController::ComputeEMA(const std::vector<MetricSnapshot>& window, double* read_trend, double* write_trend) {
   *read_trend = 0.0;
   *write_trend = 0.0;
   if (window.size() < 2) return;
 
+  // Seed both EMAs at zero and let them warm up from the first delta
+  // onward, rather than initializing r_ema/w_ema directly from the first
+  // sample's raw delta. Seeding from the first sample makes that single
+  // (often noisy) delta count for far more than alpha's intended weight,
+  // biasing the estimate right when there's the least history to trust.
+  // Paired with the kMinWindowsForSwitch guard in ShouldRewrite so the
+  // still-warming-up early values are never actually acted on.
   double r_ema = 0.0;
   double w_ema = 0.0;
   double alpha = 0.2;
@@ -18,13 +34,8 @@ void AdaptiveController::ComputeEMA(const std::vector<MetricSnapshot>& window, d
     if (r_delta < 0) r_delta = 0;
     if (w_delta < 0) w_delta = 0;
 
-    if (i == 1) {
-      r_ema = r_delta;
-      w_ema = w_delta;
-    } else {
-      r_ema = alpha * r_delta + (1.0 - alpha) * r_ema;
-      w_ema = alpha * w_delta + (1.0 - alpha) * w_ema;
-    }
+    r_ema = alpha * r_delta + (1.0 - alpha) * r_ema;
+    w_ema = alpha * w_delta + (1.0 - alpha) * w_ema;
   }
 
   double total_ema = r_ema + w_ema;
@@ -48,6 +59,24 @@ bool AdaptiveController::ShouldRewrite(FileMetaData* f, Strategy* out_strategy) 
   }
 
   if (window.size() < 2) {
+    return false;
+  }
+
+  // AMETHYST: warm-up guard against EMA cold-start bias. History is keyed
+  // by file number (history_), and file numbers change on every
+  // compaction -- so the EMA re-seeds from empty on every rewrite, not
+  // just once at DB open. In a compaction-heavy workload that means the
+  // cold-start transient recurs continuously: combined with the poll
+  // interval (Options::adaptive_poll_interval_ms), a single noisy early
+  // window can bias the controller for several poll cycles after every
+  // file rewrite. Require a minimum number of accumulated samples before
+  // trusting the EMA enough to act on it; below that, never switch.
+  // This guard (and the zero-seeded EMA above) become much less critical
+  // once stats are region-keyed instead of file-keyed -- a long-lived
+  // per-region estimator wouldn't re-seed on compaction at all -- but
+  // remain correct, cheap defensive guards for genuinely new regions
+  // even after that lands.
+  if (window.size() < kMinWindowsForSwitch) {
     return false;
   }
 
