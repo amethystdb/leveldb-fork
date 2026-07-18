@@ -1624,6 +1624,19 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
                   static_cast<long long>(tiered), static_cast<long long>(leveled));
     *value = buf;
     return true;
+  } else if (in == "adaptive-transitions") {
+    // AMETHYST: lifetime strategy-switch counts actually triggered by the
+    // adaptive controller, by direction -- lets a benchmark distinguish a
+    // real adaptive effect from tiered-read-path overhead with zero
+    // switches.
+    int64_t tiered_to_leveled = 0, leveled_to_tiered = 0;
+    versions_->TransitionCounts(&tiered_to_leveled, &leveled_to_tiered);
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "tiered_to_leveled=%lld leveled_to_tiered=%lld",
+                  static_cast<long long>(tiered_to_leveled),
+                  static_cast<long long>(leveled_to_tiered));
+    *value = buf;
+    return true;
   } else if (in == "approximate-memory-usage") {
     size_t total_usage = options_.block_cache->TotalCharge();
     if (mem_) {

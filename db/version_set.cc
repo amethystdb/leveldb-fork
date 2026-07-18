@@ -1291,6 +1291,11 @@ void VersionSet::StrategyCounts(int64_t* tiered, int64_t* leveled) const {
   }
 }
 
+void VersionSet::TransitionCounts(int64_t* tiered_to_leveled,
+                                 int64_t* leveled_to_tiered) const {
+  adaptive_controller_.GetTransitionCounts(tiered_to_leveled, leveled_to_tiered);
+}
+
 void VersionSet::TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const {
   numbers->clear();
   for (FileMetaData* f : current_->files_[level]) {

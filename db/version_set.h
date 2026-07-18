@@ -276,6 +276,14 @@ class VersionSet {
   // property), independent of testing.
   void StrategyCounts(int64_t* tiered, int64_t* leveled) const;
 
+  // AMETHYST: lifetime counts of strategy switches the adaptive controller
+  // has actually triggered, by direction. Exposed via the
+  // "leveldb.adaptive-transitions" property so benchmark harnesses can
+  // distinguish "the adaptive mechanism fired" from "the always-on
+  // tiered-read-path overhead" when a WA/RA difference shows up.
+  void TransitionCounts(int64_t* tiered_to_leveled,
+                       int64_t* leveled_to_tiered) const;
+
   // Test-only: file numbers currently present at the given level, in
   // Version order.
   void TEST_FileNumbers(int level, std::vector<uint64_t>* numbers) const;

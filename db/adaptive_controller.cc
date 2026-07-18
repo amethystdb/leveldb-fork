@@ -93,17 +93,25 @@ bool AdaptiveController::ShouldRewrite(FileMetaData* f, Strategy* out_strategy) 
     if (read_trend > 0.3 && current_read > 500) {
       *out_strategy = kLeveled;
       last_global_switch_time_us_ = now;
+      ++tiered_to_leveled_transitions_;
       return true;
     }
   } else if (f->strategy == kLeveled) {
     if (write_trend > 0.3 && current_write > 10) {
       *out_strategy = kTiered;
       last_global_switch_time_us_ = now;
+      ++leveled_to_tiered_transitions_;
       return true;
     }
   }
 
   return false;
+}
+
+void AdaptiveController::GetTransitionCounts(int64_t* tiered_to_leveled,
+                                             int64_t* leveled_to_tiered) const {
+  *tiered_to_leveled = tiered_to_leveled_transitions_;
+  *leveled_to_tiered = leveled_to_tiered_transitions_;
 }
 
 void AdaptiveController::Cleanup(const std::set<uint64_t>& active_files) {

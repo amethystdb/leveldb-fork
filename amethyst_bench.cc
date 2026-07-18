@@ -1,7 +1,11 @@
-// Amethyst Phase 2: stock-vs-adaptive benchmark harness.
+// Amethyst Track A: stock-vs-adaptive benchmark harness (built on the
+// Phase 2 harness, now that Phase 3 has made tiering genuinely REAL).
 //
 // Metrics are matched to the Go prototype's definitions
-// (ws-impl/amethyst/cmd/amethystd/main.go):
+// (ws-impl/amethyst/cmd/amethystd/main.go) and FROZEN as of Track A --
+// Track B's parameter sweep (tiered_batch_merge_run_threshold,
+// adaptive_poll_interval_ms) inherits these exact definitions, so do not
+// change their semantics here:
 //   WA = leveldb.bytes-written (flush + compaction output) / user bytes
 //        (sum of key+value bytes over every Put issued, non-deduplicated)
 //   RA = sum, per Get, of "files across ALL levels whose user-key range
@@ -13,7 +17,16 @@
 //        for the current set of live/unique keys). See the reclamation
 //        caveat in the accompanying report -- LevelDB eagerly deletes
 //        obsolete files, so this number is not comparable across engines
-//        that defer/never reclaim.
+//        that defer/never reclaim. As of Phase 3, expect SA to be
+//        measurably higher under adaptive than stock -- L1 genuinely
+//        accumulates overlapping runs now, trading space for reduced
+//        write-amp; this is the correct cost of tiering, not a bug.
+//   Transitions = lifetime tiered->leveled / leveled->tiered switch counts
+//        actually triggered by AdaptiveController::ShouldRewrite (new in
+//        Track A, via "leveldb.adaptive-transitions") -- printed in every
+//        row so a WA/RA difference can be attributed to the adaptive
+//        mechanism actually firing, not just always-on tiered-read-path
+//        overhead.
 //
 // "adaptive" toggles Options::adaptive_enabled; "stock" in the resulting
 // table means this same binary/build with adaptive_enabled=false, which
@@ -158,6 +171,17 @@ std::string GetStrategyCounts(DB* db) {
   return val;
 }
 
+// AMETHYST: lifetime tiered<->leveled switch counts the adaptive controller
+// has actually triggered. Printed in every result row so a WA/RA
+// difference can be attributed to the adaptive mechanism actually firing
+// rather than just the always-on tiered-read-path overhead -- see Step 1
+// of the Track A benchmark plan.
+std::string GetTransitionCounts(DB* db) {
+  std::string val;
+  db->GetProperty("leveldb.adaptive-transitions", &val);
+  return val;
+}
+
 // Issues `count` Puts with keys drawn uniformly from [0, keyspace),
 // tracking user bytes (key+value size, every Put counted, matching the
 // Go prototype's non-deduplicated userBytes) and the live-key map used
@@ -229,6 +253,7 @@ struct Result {
   double sa = -1;
   double throughput = -1;
   std::string throughput_label;
+  std::string transitions;
   std::string notes;
 };
 
@@ -240,10 +265,10 @@ std::string Fmt(double v) {
 }
 
 void PrintResult(const Result& r) {
-  std::printf("RESULT workload=%s mode=%s WA=%s RA=%s SA=%s throughput=%s %s",
+  std::printf("RESULT workload=%s mode=%s WA=%s RA=%s SA=%s throughput=%s %s transitions=[%s]",
               r.workload.c_str(), r.mode.c_str(), Fmt(r.wa).c_str(),
               Fmt(r.ra).c_str(), Fmt(r.sa).c_str(), Fmt(r.throughput).c_str(),
-              r.throughput_label.c_str());
+              r.throughput_label.c_str(), r.transitions.c_str());
   if (!r.notes.empty()) {
     std::printf(" notes=[%s]", r.notes.c_str());
   }
@@ -289,6 +314,7 @@ Result RunFillRandom(Env* env, bool adaptive, const std::string& dbname) {
   r.sa = double(DirLdbBytes(env, dbname)) / LogicalLiveBytes(live_keys);
   r.throughput = kKeyspace / elapsed;
   r.throughput_label = "writes/s";
+  r.transitions = GetTransitionCounts(db);
   r.notes = GetStrategyCounts(db);
 
   delete db;
@@ -327,6 +353,7 @@ Result RunReadRandom(Env* env, bool adaptive, const std::string& dbname) {
   r.sa = double(DirLdbBytes(env, dbname)) / LogicalLiveBytes(live_keys);
   r.throughput = kReads / elapsed;
   r.throughput_label = "reads/s";
+  r.transitions = GetTransitionCounts(db);
   r.notes = "WA/SA include the populate phase; " + GetStrategyCounts(db);
 
   delete db;
@@ -366,6 +393,7 @@ Result RunOverwrite(Env* env, bool adaptive, const std::string& dbname) {
   r.sa = double(DirLdbBytes(env, dbname)) / LogicalLiveBytes(live_keys);
   r.throughput = kOverwrites / elapsed;
   r.throughput_label = "writes/s";
+  r.transitions = GetTransitionCounts(db);
   r.notes = "WA/SA include the populate phase; " + GetStrategyCounts(db);
 
   delete db;
@@ -430,6 +458,7 @@ Result RunShifting(Env* env, bool adaptive, const std::string& dbname) {
   r.throughput_label = "reads/s (read phases)";
   char write_tp[64];
   std::snprintf(write_tp, sizeof(write_tp), "%.0f", total_writes / total_write_secs);
+  r.transitions = GetTransitionCounts(db);
   r.notes = std::string("write throughput=") + write_tp + " writes/s; " +
            strategy_progression + "final: " + GetStrategyCounts(db);
 
